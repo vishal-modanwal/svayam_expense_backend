@@ -2,7 +2,11 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import authRouter from "./routes/auth.routes.js"
+import authRouter from "./routes/auth.routes.js";
+import profileRouter from "./routes/profile.routes.js";
+import adminRouter from "./routes/admin.routes.js";
+import categoryRouter from "./routes/categories.routes.js";
+import expenseRouter from "./routes/expense.routes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,10 +27,14 @@ app.use((req , res , next) =>{
 })
 
 app.use('/api/auth' , authRouter);
+app.use('/api/profile' , profileRouter);
+app.use('/api/admin' , adminRouter);
+app.use('/api/category' , categoryRouter);
+app.use('/api/expense' , expenseRouter);
 
 // Health Check
 app.get('/', (req, res) => {
-    res.send('Svayam Expense Tracker API is running...');
+    res.send('Svayam Expense Tracker is running...');
 });
 
 export default app;

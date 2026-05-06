@@ -2,6 +2,7 @@
 node_modules/
 jspm_packages/
 upload
+apihelper.txt
 
 # Debug logs
 npm-debug.log*
