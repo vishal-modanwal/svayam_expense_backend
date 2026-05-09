@@ -7,5 +7,5 @@ const router = express.Router();
 router.route('/').get(auth , getMe);
 router.route('/update').put(auth , updateProfile);
 router.route('/forgetPassword').post(forgotPassword);
-router.route('resetPassword' , auth , resetPassword);
+router.route('/resetPassword').post(resetPassword);
 export default router;

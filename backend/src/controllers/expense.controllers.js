@@ -26,14 +26,25 @@ const rowToJson = (row) =>
  * 4. Safe data extraction (Optional Chaining)
  */
 export const addExpense = async (req, res) => {
-    const { 
-        title, category_id, amount, payment_method, 
-        vendor, description, expense_date, expense_type 
+    const {
+        title,
+        category_id: rawCategoryId,
+        amount: rawAmount,
+        payment_method,
+        vendor,
+        description,
+        expense_date,
+        expense_type
     } = req.body;
-    
+
+    const category_id =
+        rawCategoryId === undefined || rawCategoryId === '' ? rawCategoryId : parseInt(String(rawCategoryId), 10);
+    const amount = rawAmount === undefined || rawAmount === '' ? NaN : parseFloat(String(rawAmount));
+
     const user_id = req.user.id;
-    const user_role = req.user.role; 
-    const receipt_path = req.file ? req.file.path : null;
+    const user_role = req.user.role;
+    /** Stored filename only; served at GET /uploads/:filename */
+    const receipt_path = req.file ? req.file.filename : null;
     
     // MariaDB/MySQL Date handling
     const finalDate = expense_date ? new Date(expense_date) : new Date();
@@ -53,9 +64,14 @@ export const addExpense = async (req, res) => {
             return res.status(403).json({ message: "Unauthorized: Sirf Admin extra expense add kar sakta hai." });
         }
 
-        if (category_id == null || category_id === '') {
+        if (category_id == null || category_id === '' || !Number.isFinite(category_id)) {
             await connection.rollback();
             return res.status(400).json({ status: "error", message: "category_id is required." });
+        }
+
+        if (!Number.isFinite(amount) || amount < 0) {
+            await connection.rollback();
+            return res.status(400).json({ status: "error", message: "amount must be a valid non-negative number." });
         }
 
         const catRaw = await connection.query("SELECT id FROM categories WHERE id = ?", [category_id]);
@@ -243,9 +259,28 @@ export const updateExpense = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ message: 'Invalid expense id' });
 
-    const { title, amount, category_id, description, expense_type } = req.body;
+    const {
+        title,
+        amount: rawAmount,
+        category_id: rawCategoryId,
+        description,
+        expense_type,
+        payment_method,
+        vendor
+    } = req.body;
+
+    const category_id =
+        rawCategoryId === undefined || rawCategoryId === ''
+            ? NaN
+            : parseInt(String(rawCategoryId), 10);
+    const amount = rawAmount === undefined || rawAmount === '' ? NaN : parseFloat(String(rawAmount));
+
     if (expense_type === 'extra' && req.user.role !== 'admin') {
         return res.status(403).json({ message: 'Only admin can set expense_type to extra.' });
+    }
+
+    if (!Number.isFinite(category_id) || !Number.isFinite(amount) || amount < 0) {
+        return res.status(400).json({ message: 'amount and category_id must be valid numbers.' });
     }
 
     try {
@@ -260,12 +295,25 @@ export const updateExpense = async (req, res) => {
 
         const isAdmin = req.user.role === 'admin';
         const typeVal = expense_type || 'standard';
-        const sql = isAdmin
-            ? `UPDATE expenses SET title = ?, amount = ?, category_id = ?, description = ?, expense_type = ? WHERE id = ?`
-            : `UPDATE expenses SET title = ?, amount = ?, category_id = ?, description = ?, expense_type = ? WHERE id = ? AND user_id = ?`;
-        const params = isAdmin
-            ? [title, amount, category_id, description, typeVal, id]
-            : [title, amount, category_id, description, typeVal, id, req.user.id];
+        const newReceipt = req.file ? req.file.filename : null;
+
+        let sql;
+        let params;
+        if (newReceipt) {
+            sql = isAdmin
+                ? `UPDATE expenses SET title = ?, amount = ?, category_id = ?, description = ?, expense_type = ?, receipt_path = ?, payment_method = COALESCE(?, payment_method), vendor = COALESCE(?, vendor) WHERE id = ?`
+                : `UPDATE expenses SET title = ?, amount = ?, category_id = ?, description = ?, expense_type = ?, receipt_path = ?, payment_method = COALESCE(?, payment_method), vendor = COALESCE(?, vendor) WHERE id = ? AND user_id = ?`;
+            params = isAdmin
+                ? [title, amount, category_id, description, typeVal, newReceipt, payment_method ?? null, vendor ?? null, id]
+                : [title, amount, category_id, description, typeVal, newReceipt, payment_method ?? null, vendor ?? null, id, req.user.id];
+        } else {
+            sql = isAdmin
+                ? `UPDATE expenses SET title = ?, amount = ?, category_id = ?, description = ?, expense_type = ?, payment_method = COALESCE(?, payment_method), vendor = COALESCE(?, vendor) WHERE id = ?`
+                : `UPDATE expenses SET title = ?, amount = ?, category_id = ?, description = ?, expense_type = ?, payment_method = COALESCE(?, payment_method), vendor = COALESCE(?, vendor) WHERE id = ? AND user_id = ?`;
+            params = isAdmin
+                ? [title, amount, category_id, description, typeVal, payment_method ?? null, vendor ?? null, id]
+                : [title, amount, category_id, description, typeVal, payment_method ?? null, vendor ?? null, id, req.user.id];
+        }
 
         const result = await pool.query(sql, params);
         const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;

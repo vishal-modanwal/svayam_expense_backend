@@ -9,3 +9,4 @@ export const getOTPExpiry = () => {
   return expiryDate;
 };
 
+console.log(otp());

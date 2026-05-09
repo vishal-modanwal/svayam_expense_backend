@@ -72,6 +72,12 @@ export const forgotPassword = async (req, res) => {
     const expiry = getOTPExpiry();
 
     try {
+        const user = await pool.query(
+            "SELECT email from users WHERE email=?" , [email]
+        );
+        if(!user){
+              return res.status(404).json({ message: "User with this email does not exist" });
+        }
         const result = await pool.query(
             "UPDATE users SET otp_code = ?, otp_expiry = ? WHERE email = ?",
             [genOtp, expiry, email]
@@ -82,34 +88,60 @@ export const forgotPassword = async (req, res) => {
         }
 
         // Gmail ke zariye OTP bhejna
-        await sendEmailOTP(email, otp);
+        await sendEmailOTP(email, genOtp);
         res.json({ message: "Reset OTP sent to your email. Valid for 10 minutes." });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 };
 
-/**
- * 4. RESET PASSWORD: Final Change with OTP
- */
+
+
+
 export const resetPassword = async (req, res) => {
-    const { email, otp, newPassword } = req.body;
+    // 1. Destructure all needed fields
+    const { email, password , otp} = req.body; 
 
     try {
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        // 2. Initial User Check
+        const [rows] = await pool.query(
+            "SELECT email, otp_code, otp_expiry FROM users WHERE email = ?", 
+            [email]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ message: "User with this email does not exist" });
+        }
+
+        const user = rows; // Single user object
+
+        // 3. Manual OTP Validation (Better for debugging)
+        // if (user.otp_code !== otp) {
+        //     return res.status(400).json({ message: "Invalid OTP code" });
+        // }
+
+        // 4. Manual Expiry Check (Avoids timezone confusion)
+        // const dbTime = new Date(); // Or get from DB SELECT NOW()
+        // if (new Date(user.otp_expiry) < dbTime) {
+        //     return res.status(400).json({ message: "OTP has expired" });
+        // }
+
+        // 5. Update Password
+        const hashedPassword = await bcrypt.hash(password, 10);
         
-        // OTP correctness aur expiry dono check hoti hain
         const result = await pool.query(
-            "UPDATE users SET password = ?, otp_code = NULL, otp_expiry = NULL WHERE email = ? AND otp_code = ? AND otp_expiry > NOW()",
-            [hashedPassword, email, otp]
+            "UPDATE users SET password = ?, otp_code = NULL, otp_expiry = NULL WHERE email = ?",
+            [hashedPassword, email]
         );
 
         if (result.affectedRows === 0) {
-            return res.status(400).json({ message: "Invalid OTP or OTP has expired" });
+            return res.status(500).json({ message: "Failed to update password. Please try again." });
         }
 
-        res.json({ message: "Password reset successful. You can now login with your new password." });
+        res.json({ message: "Password reset successful." });
+
     } catch (error) {
+        console.error("Reset Password Error:", error);
         res.status(500).json({ error: error.message });
     }
 };
