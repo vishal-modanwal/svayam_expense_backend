@@ -53,6 +53,7 @@ export const getBudgetTableMeta = (_req, res) => {
         { key: "budget_id", label: "Budget ID", db_column: "monthly_budgets.id" },
         { key: "category_id", label: "Category ID", db_column: "monthly_budgets.category_id" },
         { key: "category_name", label: "Category", db_column: "categories.name" },
+        { key: "category_description", label: "Category description", db_column: "categories.description" },
         { key: "month", label: "Month", db_column: "monthly_budgets.month" },
         { key: "year", label: "Year", db_column: "monthly_budgets.year" },
         { key: "allocated_amount", label: "Allocated Amount", db_column: "monthly_budgets.allocated_amount" },

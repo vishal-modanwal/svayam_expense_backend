@@ -4,6 +4,34 @@ import { sendEmailOTP } from '../utils/emailService.js';
 import { otp  , getOTPExpiry} from '../utils/otp.js';
 
 /**
+ * Logged-in user's account activity (enabled / disabled by admin).
+ */
+export const getMyActivityStatus = async (req, res) => {
+    const userId = req.user.id;
+
+    try {
+        const rows = await pool.query("SELECT id, is_active FROM users WHERE id = ?", [userId]);
+        const list = Array.isArray(rows) ? rows : [];
+        if (list.length === 0) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        const row = list[0];
+        const uid = typeof row.id === "bigint" ? Number(row.id) : Number(row.id);
+        const active = Number(row.is_active) === 1;
+
+        res.json({
+            status: "success",
+            user_id: uid,
+            is_active: active,
+            activity_status: active ? "active" : "inactive"
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+};
+
+/**
  * 1. GET ME: Fetch logged-in user's profile
  */
 export const getMe = async (req, res) => {

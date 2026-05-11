@@ -4,6 +4,7 @@ import { auth } from "../middlewares/auth.middleware.js";
 import {
     createCategoryWithBudget,
     deleteBudget,
+    getDashboardExpensesByView,
     getCategoryWiseBudgets,
     getTotalBudgetsSummary,
     getUsersDetails,
@@ -15,9 +16,18 @@ const router = Router();
 router.route('/toggle/:id').patch(auth , adminOnly, toggleUserStatus);
 router.route('/users-details').get(auth, adminOnly, getUsersDetails);
 router.route('/CategoryBudget').post(auth , adminOnly , createCategoryWithBudget);
+/** Same as PUT/PATCH /budget/:id — monthly_budgets.id (budget_id from budget-details). */
+router.route('/CategoryBudget/:id')
+    .put(auth, adminOnly, updateBudget)
+    .patch(auth, adminOnly, updateBudget)
+    .delete(auth, adminOnly, deleteBudget);
 router.route('/total-summary').get(auth , adminOnly,  getTotalBudgetsSummary);
+router.route('/dashboard-expenses').get(auth, adminOnly, getDashboardExpensesByView);
 router.route('/budget-details').get(auth, adminOnly, getCategoryWiseBudgets);
 /** monthly_budgets row id — from GET /budget-details as budget_id */
-router.route('/budget/:id').put(auth, adminOnly, updateBudget).delete(auth, adminOnly, deleteBudget);
+router.route('/budget/:id')
+    .put(auth, adminOnly, updateBudget)
+    .patch(auth, adminOnly, updateBudget)
+    .delete(auth, adminOnly, deleteBudget);
 
 export default router;

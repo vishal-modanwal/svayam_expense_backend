@@ -3,6 +3,9 @@ node_modules/
 jspm_packages/
 upload
 apihelper.txt
+# Receipt uploads (multer: backend/src/public/receipts)
+public/receipts/
+src/public/receipts/
 
 # Debug logs
 npm-debug.log*

@@ -97,12 +97,12 @@ export const login = async (req, res) => {
 
     try {
         const rows = await pool.query(
-            `SELECT * FROM users WHERE (email = ? OR mobile_no = ?) AND is_active = 1`,
+            `SELECT * FROM users WHERE (email = ? OR mobile_no = ?)`,
             [email, mobile_no]
         );
         const user = rows[0];
 
-        if (!user) return res.status(401).json({ message: "Invalid credentials or account not active." });
+        if (!user) return res.status(401).json({ message: "Invalid credentials" });
 
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(401).json({ message: "Incorrect password." });

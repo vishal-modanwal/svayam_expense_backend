@@ -154,14 +154,48 @@ export const addExpense = async (req, res) => {
         if (connection) connection.release();
     }
 };
-// Helper function for reusable pagination & filtering logic
-const fetchExpenses = async (whereClauses, queryParams, reqQuery) => {
-    const { page = 1, sortBy = 'expense_date', order = 'DESC' } = reqQuery;
-    const limit = 8;
-    const offset = (page - 1) * limit;
+/**
+ * Shared list query for expenses.
+ * @param {{ mode?: 'my' }} [options] — `mode: 'my'` enables my-expenses rules: default limit 15, search title/vendor, sort whitelist, order asc|desc only.
+ */
+const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) => {
+    const isMy = options.mode === "my";
+    const page = Math.max(parseInt(reqQuery.page, 10) || 1, 1);
+    const orderRaw = String(reqQuery.order ?? "desc").toLowerCase();
+    const orderDir = orderRaw === "asc" ? "ASC" : "DESC";
 
-    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
-    const sortCol = sortBy === 'amount' ? 'e.amount' : 'e.expense_date';
+    let limit;
+    let sortCol;
+    let sortByEcho;
+
+    const clauses = [...whereClauses];
+    const params = [...queryParams];
+
+    if (isMy) {
+        limit = Math.min(Math.max(parseInt(reqQuery.limit, 10) || 15, 1), 100);
+        const sortMap = {
+            expense_date: "e.expense_date",
+            amount: "e.amount",
+            created_at: "e.created_at"
+        };
+        const sb = String(reqQuery.sortBy || "expense_date").trim();
+        sortCol = sortMap[sb] || sortMap.expense_date;
+        sortByEcho = Object.keys(sortMap).includes(sb) ? sb : "expense_date";
+
+        const search = String(reqQuery.search ?? "").trim();
+        if (search) {
+            clauses.push("(e.title LIKE ? OR e.vendor LIKE ?)");
+            params.push(`%${search}%`, `%${search}%`);
+        }
+    } else {
+        limit = 8;
+        const sortBy = reqQuery.sortBy === "amount" ? "amount" : "expense_date";
+        sortCol = sortBy === "amount" ? "e.amount" : "e.expense_date";
+        sortByEcho = sortBy;
+    }
+
+    const offset = (page - 1) * limit;
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
 
     const dataSql = `
         SELECT e.*, u.name as user_name, c.name as category_name 
@@ -169,24 +203,35 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery) => {
         JOIN users u ON e.user_id = u.id 
         JOIN categories c ON e.category_id = c.id 
         ${whereSql}
-        ORDER BY ${sortCol} ${order}, e.id DESC 
+        ORDER BY ${sortCol} ${orderDir}, e.id DESC 
         LIMIT ? OFFSET ?
     `;
 
     const countSql = `SELECT COUNT(*) as total FROM expenses e JOIN users u ON e.user_id = u.id ${whereSql}`;
 
-    const rows = await pool.query(dataSql, [...queryParams, limit, offset]);
-    const countRows = await pool.query(countSql, queryParams);
+    const rows = await pool.query(dataSql, [...params, limit, offset]);
+    const countRows = await pool.query(countSql, params);
     const total = Number(countRows[0]?.total ?? 0);
 
-    return {
-        data: Array.isArray(rows) ? rows.map(rowToJson) : rows,
-        pagination: {
-            totalItems: total,
-            currentPage: parseInt(page),
-            totalPages: Math.ceil(total / limit)
-        }
+    const basePagination = {
+        totalItems: total,
+        currentPage: page,
+        totalPages: Math.ceil(total / limit) || 0
     };
+
+    const result = {
+        data: Array.isArray(rows) ? rows.map(rowToJson) : rows,
+        pagination: isMy ? { ...basePagination, limit } : basePagination
+    };
+
+    if (isMy) {
+        result.sorting = {
+            sort_by: sortByEcho,
+            order: orderDir.toLowerCase()
+        };
+    }
+
+    return result;
 };
 
 /**
@@ -213,7 +258,11 @@ export const getAllExpenses = async (req, res) => {
 
 /**
  * 2. GET USER EXPENSES (Self Only)
- * Sirf login user apna data dekh payega.
+ * Sirf login user apna data. Pagination: page (default 1), limit (default 15, max 100).
+ * Latest first: sortBy=expense_date (default) + order=desc (default).
+ * sortBy: expense_date | amount | created_at. order: asc | desc.
+ * search: optional — matches title OR vendor (substring, LIKE).
+ * Optional category_id filter (unchanged).
  */
 export const getUserExpenses = async (req, res) => {
     try {
@@ -226,7 +275,7 @@ export const getUserExpenses = async (req, res) => {
             queryParams.push(category_id);
         }
 
-        const result = await fetchExpenses(whereClauses, queryParams, req.query);
+        const result = await fetchExpenses(whereClauses, queryParams, req.query, { mode: "my" });
         res.json({ status: "success", ...result });
     } catch (error) {
         res.status(500).json({ error: error.message });

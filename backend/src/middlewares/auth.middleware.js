@@ -19,12 +19,12 @@ export const auth = async (req, res, next) => {
 
             // 3. Fetch user from DB to ensure they still exist and are active
             const rows = await pool.query(
-                "SELECT id, name, email, role FROM users WHERE id = ? AND is_active = 1",
+                "SELECT id, name, email, role FROM users WHERE id = ?",
                 [decoded.id]
             );
 
             if (rows.length === 0) {
-                return res.status(401).json({ message: "Not authorized, user not found or inactive" });
+                return res.status(401).json({ message: "Not authorized, user not found" });
             }
 
             // 4. Attach user to request object
