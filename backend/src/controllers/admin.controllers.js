@@ -464,7 +464,8 @@ export const getCategoryWiseBudgets = async (req, res) => {
 /**
  * GET EXPENSE TABLE DATA FOR ADMIN DASHBOARD (role/type wise)
  * Query:
- * - view=users | admins | admins-extra (required)
+ * - view=users | users-inactive | admins | admins-extra (required)
+ *   — users: role user + is_active; users-inactive: role user + inactive; admins: role admin; admins-extra: admin + extra
  * - page (default 1), limit (default 10, max 100)
  * - sortBy=expense_date|amount|created_at (default expense_date)
  * - order=asc|desc (default desc)
@@ -472,10 +473,10 @@ export const getCategoryWiseBudgets = async (req, res) => {
 export const getDashboardExpensesByView = async (req, res) => {
     try {
         const { view } = req.query;
-        const allowedViews = new Set(["users", "admins", "admins-extra"]);
+        const allowedViews = new Set(["users", "users-inactive", "admins", "admins-extra"]);
         if (!allowedViews.has(String(view || "").trim())) {
             return res.status(400).json({
-                message: "Invalid view. Use one of: users, admins, admins-extra"
+                message: "Invalid view. Use one of: users, users-inactive, admins, admins-extra"
             });
         }
 
@@ -496,7 +497,12 @@ export const getDashboardExpensesByView = async (req, res) => {
 
         if (view === "users") {
             where.push("u.role = ?");
-            params.push("admin");
+            where.push("u.is_active = 1");
+            params.push("user");
+        } else if (view === "users-inactive") {
+            where.push("u.role = ?");
+            where.push("u.is_active = 0");
+            params.push("user");
         } else if (view === "admins") {
             where.push("u.role = ?");
             params.push("admin");
@@ -522,6 +528,7 @@ export const getDashboardExpensesByView = async (req, res) => {
                 u.name AS user_name,
                 u.email AS user_email,
                 u.role AS user_role,
+                u.is_active AS user_is_active,
                 c.id AS category_id,
                 c.name AS category_name
             FROM expenses e
@@ -570,7 +577,9 @@ export const getDashboardExpensesByView = async (req, res) => {
                     id: num(row.user_id),
                     name: row.user_name,
                     email: row.user_email,
-                    role: row.user_role
+                    role: row.user_role,
+                    is_active: Boolean(num(row.user_is_active)),
+                    activity_status: num(row.user_is_active) === 1 ? "active" : "inactive"
                 },
                 category: {
                     id: num(row.category_id),
