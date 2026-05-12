@@ -1,6 +1,7 @@
 import { pool } from '../db/index.js';
 import Tesseract from 'tesseract.js';
 import { sendExpenseReportPdf } from '../utils/expenseReportPdf.js';
+import { fireBudget90Alert, fireBudget90AlertAfterUpdate } from '../utils/budgetThresholdAlert.js';
 
 /** MariaDB driver often returns insertId / INT columns as BigInt; JSON.stringify cannot serialize BigInt */
 const jsonNumber = (v) => (typeof v === 'bigint' ? Number(v) : v);
@@ -50,6 +51,8 @@ export const addExpense = async (req, res) => {
     const finalDate = expense_date ? new Date(expense_date) : new Date();
 
     let connection;
+    /** Set when a standard expense passes budget checks — used after commit for 90% admin email */
+    let standardBudgetSnapshot = null;
 
     try {
         // Pool se connection acquire karein
@@ -89,7 +92,7 @@ export const addExpense = async (req, res) => {
             // Check Allocated Budget
             // Note: MariaDB mein [rows] destructuring tabhi kaam karegi jab pool 'mysql2/promise' se bana ho
             const budgetResult = await connection.query(
-                `SELECT allocated_amount FROM monthly_budgets 
+                `SELECT allocated_amount, currency FROM monthly_budgets 
                  WHERE category_id = ? AND month = MONTH(?) AND year = YEAR(?)`,
                 [category_id, finalDate, finalDate]
             );
@@ -106,6 +109,7 @@ export const addExpense = async (req, res) => {
             }
 
             const allocatedAmount = parseFloat(budgetRows[0].allocated_amount);
+            const budgetCurrency = budgetRows[0].currency || 'INR';
 
             // Calculate current total spent
             const spentResult = await connection.query(
@@ -128,6 +132,15 @@ export const addExpense = async (req, res) => {
                     available: (allocatedAmount - currentTotalSpent).toFixed(2)
                 });
             }
+
+            standardBudgetSnapshot = {
+                categoryId: category_id,
+                expenseDate: finalDate,
+                previousStandardSpentInBucket: currentTotalSpent,
+                newStandardSpentInBucket: currentTotalSpent + newAmount,
+                allocatedAmount,
+                currency: budgetCurrency
+            };
         }
 
         // 4. Record Expense (MariaDB driver returns a single metadata object for INSERT, not [rows, fields])
@@ -139,6 +152,10 @@ export const addExpense = async (req, res) => {
 
         // 5. Commit Transaction
         await connection.commit();
+
+        if (standardBudgetSnapshot) {
+            fireBudget90Alert(pool, standardBudgetSnapshot);
+        }
 
         res.status(201).json({ 
             status: "success", 
@@ -333,11 +350,16 @@ export const updateExpense = async (req, res) => {
     }
 
     try {
-        const existing = await pool.query('SELECT user_id FROM expenses WHERE id = ?', [id]);
-        const rows = Array.isArray(existing) ? existing : [];
+        const existing = await pool.query(
+            'SELECT user_id, amount, category_id, expense_type, expense_date FROM expenses WHERE id = ?',
+            [id]
+        );
+        const rawExisting = Array.isArray(existing) ? existing : [];
+        const rows = Array.isArray(rawExisting[0]) ? rawExisting[0] : rawExisting;
         if (!rows.length) return res.status(404).json({ message: 'Expense not found' });
 
-        const ownerId = jsonNumber(rows[0].user_id);
+        const existingRow = rowToJson(rows[0]);
+        const ownerId = jsonNumber(existingRow.user_id);
         if (req.user.role !== 'admin' && ownerId !== jsonNumber(req.user.id)) {
             return res.status(403).json({ message: 'Not allowed to update this expense' });
         }
@@ -367,6 +389,12 @@ export const updateExpense = async (req, res) => {
         const result = await pool.query(sql, params);
         const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
         if (affected === 0) return res.status(404).json({ message: 'Expense not found or not updated' });
+
+        fireBudget90AlertAfterUpdate(existingRow, {
+            amount,
+            category_id,
+            expense_type: typeVal
+        });
 
         res.json({ message: 'Updated successfully' });
     } catch (error) {

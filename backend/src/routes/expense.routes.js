@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { 
     getAllExpenses, 
-    getUserExpenses, 
+    getUserExpenses,
     searchExpensesByUserName,
     addExpense,
     updateExpense,

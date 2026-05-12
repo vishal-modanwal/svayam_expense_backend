@@ -217,6 +217,8 @@ export const getTotalBudgetsSummary = async (req, res) => {
 /**
  * GET ALL USERS DETAILS (Admin Only)
  * Returns user profile fields + expense aggregates.
+ * Query: page (default 1), limit (default 10, max 100); search — matches name, email, or mobile (substring);
+ * is_active (1/0 or true/false); sortBy: created_at|name|email|mobile_no|total_expenses|expense_record_count|is_active; order asc|desc.
  */
 export const getUsersDetails = async (req, res) => {
     try {
@@ -227,10 +229,11 @@ export const getUsersDetails = async (req, res) => {
 
         const where = [];
         const params = [];
+        const searchTrim = String(search ?? "").trim();
 
-        if (search && String(search).trim() !== "") {
-            where.push("(u.name LIKE ? OR u.email LIKE ? OR u.mobile_no LIKE ?)");
-            const q = `%${String(search).trim()}%`;
+        if (searchTrim !== "") {
+            where.push("(u.name LIKE ? OR u.email LIKE ? OR COALESCE(u.mobile_no, '') LIKE ?)");
+            const q = `%${searchTrim}%`;
             params.push(q, q, q);
         }
 
@@ -307,12 +310,14 @@ export const getUsersDetails = async (req, res) => {
         res.json({
             status: "success",
             total_users: totalUsers,
+            search: searchTrim || undefined,
             column_count: columns.length,
             columns,
             pagination: {
                 page,
                 limit,
-                total_pages: Math.ceil(totalUsers / limit)
+                total_records: totalUsers,
+                total_pages: Math.ceil(totalUsers / limit) || 0
             },
             sorting: {
                 sort_by: Object.keys(sortable).includes(String(sortBy)) ? String(sortBy) : "created_at",
@@ -523,6 +528,7 @@ export const getDashboardExpensesByView = async (req, res) => {
                 e.expense_date,
                 e.payment_method,
                 e.vendor,
+                e.receipt_path,
                 e.created_at,
                 u.id AS user_id,
                 u.name AS user_name,
@@ -572,6 +578,7 @@ export const getDashboardExpensesByView = async (req, res) => {
                 expense_date: row.expense_date,
                 payment_method: row.payment_method,
                 vendor: row.vendor,
+                receipt_path: row.receipt_path ?? null,
                 created_at: row.created_at,
                 user: {
                     id: num(row.user_id),
@@ -728,7 +735,8 @@ export const updateBudget = async (req, res) => {
 };
 
 /**
- * DELETE a monthly budget row (monthly_budgets.id). Does not delete category.
+ * DELETE a monthly budget row (monthly_budgets.id).
+ * If no monthly_budgets rows remain for that category and the category has no expenses, deletes the category too.
  * Rules: not for closed past months; blocked if any expense exists for that category in that month.
  */
 export const deleteBudget = async (req, res) => {
@@ -774,16 +782,51 @@ export const deleteBudget = async (req, res) => {
 
         await pool.query("DELETE FROM monthly_budgets WHERE id = ?", [budgetId]);
 
-        res.json({
+        const categoryId = num(meta.category_id);
+        let categoryDeleted = false;
+        let categoryRetainedReason = null;
+
+        const remainingBudgets = await pool.query(
+            "SELECT COUNT(*) AS cnt FROM monthly_budgets WHERE category_id = ?",
+            [categoryId]
+        );
+        const rem = Array.isArray(remainingBudgets) ? remainingBudgets[0] : null;
+        const budgetCountLeft = num(rem?.cnt ?? rem?.CNT);
+
+        if (budgetCountLeft === 0) {
+            const linkedExpenses = await pool.query(
+                "SELECT id FROM expenses WHERE category_id = ? LIMIT 1",
+                [categoryId]
+            );
+            const expRows = Array.isArray(linkedExpenses) ? linkedExpenses : [];
+            if (expRows.length > 0) {
+                categoryRetainedReason =
+                    "Category kept: expenses exist for this category. Remove or reassign expenses to delete the category.";
+            } else {
+                const catDel = await pool.query("DELETE FROM categories WHERE id = ?", [categoryId]);
+                if (catDel.affectedRows > 0) {
+                    categoryDeleted = true;
+                }
+            }
+        }
+
+        const payload = {
             status: "success",
-            message: "Budget deleted successfully",
+            message: categoryDeleted
+                ? "Budget and category deleted successfully"
+                : "Budget deleted successfully",
             deleted: {
                 budget_id: budgetId,
-                category_id: num(meta.category_id),
+                category_id: categoryId,
                 month: num(meta.month),
                 year: num(meta.year)
-            }
-        });
+            },
+            category_deleted: categoryDeleted
+        };
+        if (categoryRetainedReason) {
+            payload.category_retained_reason = categoryRetainedReason;
+        }
+        res.json(payload);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
