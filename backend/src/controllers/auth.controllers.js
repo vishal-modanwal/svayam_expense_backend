@@ -1,7 +1,7 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db/index.js'; // Pool connection from your db config
-import { sendEmailOTP } from '../utils/emailService.js';
+import { sendEmailOTP, sendWelcomeOnboardingEmail } from '../utils/emailService.js';
 import { getOTPExpiry, otp } from '../utils/otp.js';
 
 /**
@@ -81,6 +81,10 @@ export const register = async (req, res) => {
                 is_active = 1
              WHERE email = ?`,
             [name, mobile_no, hashedPassword, email]
+        );
+
+        sendWelcomeOnboardingEmail(email, name).catch((err) =>
+            console.error('Welcome email failed:', err.message)
         );
 
         res.json({ message: "Registration successful! You can now login." });

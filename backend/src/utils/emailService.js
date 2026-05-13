@@ -1,7 +1,22 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const EMAIL_ASSETS_DIR = path.join(__dirname, '../public/email');
+/** Prefer svayam-expense-logo.* in public/email; fall back to legacy tracker asset; else inline SVG. */
+const LOGO_FILENAME_CANDIDATES = [
+    'svayam-expense-logo.png',
+    'svayam-expense-logo.jpg',
+    'svayam-expense-logo.jpeg',
+    'svayam-expense-logo.webp',
+    'svayam-tracker-logo.png'
+];
+const LOGO_CID = 'svayamexpense-logo@svayam';
 
 const transporter = nodemailer.createTransport({
     service: 'gmail',
@@ -11,19 +26,164 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-const mailConfigured = () =>
+const BRAND_TAGLINE = 'Clear spending. Smarter budgets.';
+
+export const mailConfigured = () =>
     Boolean(String(process.env.GMAIL_USER || '').trim() && String(process.env.GMAIL_PASS || '').trim());
+
+export function escapeHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function resolveLogoFilePath() {
+    const fromEnv = String(process.env.EMAIL_HEADER_LOGO_PATH || '').trim();
+    if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+    for (const name of LOGO_FILENAME_CANDIDATES) {
+        const p = path.join(EMAIL_ASSETS_DIR, name);
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
+
+const HEADER_LOGO_HEIGHT_PX = 36;
+
+/** Small badge when no file logo — reads on navy header. */
+function brandMarkSvgDataUri() {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36"><rect width="36" height="36" rx="8" fill="#f1f5f9"/><text x="18" y="24" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="16" font-weight="800" fill="#0f172a">S</text></svg>`;
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+function buildHeaderLogoWordmarkRow(logoImgHtml) {
+    const wordmark =
+        '<span style="font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:21px;font-weight:800;color:#f8fafc;letter-spacing:-0.02em;line-height:1.2;white-space:nowrap;">SvayamExpense</span>';
+    return `<table role="presentation" cellspacing="0" cellpadding="0" align="center" style="margin:0 auto;"><tr><td style="padding:0;vertical-align:middle;">${logoImgHtml}</td><td style="padding:0 0 0 14px;vertical-align:middle;">${wordmark}</td></tr></table>`;
+}
+
+/**
+ * @returns {{ headerInnerHtml: string, attachments: { filename: string; path: string; cid: string }[] }}
+ */
+function buildBrandHeader() {
+    const h = HEADER_LOGO_HEIGHT_PX;
+    const logoPath = resolveLogoFilePath();
+    if (logoPath) {
+        const logoImg = `<img src="cid:${LOGO_CID}" alt="" height="${h}" style="display:block;height:${h}px;width:auto;max-width:140px;border:0;outline:none;text-decoration:none;" />`;
+        return {
+            headerInnerHtml: buildHeaderLogoWordmarkRow(logoImg),
+            attachments: [
+                {
+                    filename: path.basename(logoPath),
+                    path: logoPath,
+                    cid: LOGO_CID
+                }
+            ]
+        };
+    }
+    const src = brandMarkSvgDataUri();
+    const logoImg = `<img src="${src}" width="${h}" height="${h}" alt="" style="display:block;height:${h}px;width:${h}px;border:0;outline:none;text-decoration:none;" />`;
+    return {
+        headerInnerHtml: buildHeaderLogoWordmarkRow(logoImg),
+        attachments: []
+    };
+}
+
+/**
+ * SvayamExpense layout: navy header, centered hero, left-accent detail card (email-client friendly tables).
+ * @returns {{ html: string, attachments: { filename: string; path: string; cid: string }[] }}
+ */
+function layoutSvayamExpenseEmail({ headline, sublineHtml, cardTitle, cardSubtitle, cardIntroHtml, rows, footerHtml }) {
+    const outer =
+        'margin:0;padding:0;background-color:#e8ecf1;font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;';
+    const wrap = 'max-width:600px;margin:0 auto;padding:24px 12px 40px;';
+    const shell =
+        'background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 30px rgba(15,23,42,0.08);border:1px solid #e2e8f0;';
+    const header =
+        'background-color:#0f172a;padding:36px 28px 32px;text-align:center;border-bottom:1px solid #1e293b;';
+    const tag = 'margin:14px 0 0;font-size:13px;color:#94a3b8;line-height:1.5;';
+    const { headerInnerHtml, attachments: headerAttachments } = buildBrandHeader();
+    const heroPad = 'padding:36px 28px 8px;text-align:center;';
+    const h1 = 'margin:0;font-size:26px;font-weight:700;color:#0f172a;line-height:1.35;letter-spacing:-0.02em;';
+    const sub = 'margin:16px auto 0;max-width:480px;font-size:15px;color:#64748b;line-height:1.65;text-align:center;';
+    const cardWrap = 'padding:8px 28px 36px;';
+    const card =
+        'background-color:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;border-left:4px solid #2563eb;padding:22px 22px 22px 20px;text-align:left;';
+    const ct = 'margin:0;font-size:18px;font-weight:700;color:#0f172a;line-height:1.3;';
+    const cs = 'margin:6px 0 0;font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.06em;';
+    const ci = 'margin:14px 0 0;font-size:14px;color:#64748b;line-height:1.6;';
+    const rowLabel =
+        'font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.08em;padding:14px 0 4px;vertical-align:top;width:38%;';
+    const rowVal = 'font-size:15px;font-weight:700;color:#0f172a;padding:14px 0 4px;vertical-align:top;text-align:right;';
+    const hr = 'border:none;border-top:1px solid #e2e8f0;margin:12px 0 0;';
+
+    const rowHtml = rows
+        .map(
+            (r) => `
+    <tr>
+      <td style="${rowLabel}">${escapeHtml(r.label)}</td>
+      <td style="${rowVal}">${r.valueHtml}</td>
+    </tr>`
+        )
+        .join('');
+
+    const htmlOut = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="x-ua-compatible" content="ie=edge"></head>
+<body style="${outer}">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#e8ecf1;"><tr><td style="${wrap}">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="${shell}">
+      <tr><td style="${header}">
+        ${headerInnerHtml}
+        <p style="${tag}">${escapeHtml(BRAND_TAGLINE)}</p>
+      </td></tr>
+      <tr><td style="${heroPad}">
+        <h1 style="${h1}">${headline}</h1>
+        <div style="${sub}">${sublineHtml}</div>
+      </td></tr>
+      <tr><td style="${cardWrap}">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="${card}">
+          <tr><td>
+            <p style="${ct}">${escapeHtml(cardTitle)}</p>
+            <p style="${cs}">${escapeHtml(cardSubtitle)}</p>
+            <div style="${ci}">${cardIntroHtml}</div>
+            <hr style="${hr}" />
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin-top:4px;">${rowHtml}</table>
+          </td></tr>
+        </table>
+      </td></tr>
+      <tr><td style="padding:0 28px 28px;font-size:12px;color:#94a3b8;line-height:1.55;text-align:center;">${footerHtml}</td></tr>
+    </table>
+  </td></tr></table>
+</body>
+</html>`;
+
+    return { html: htmlOut, attachments: headerAttachments };
+}
+
+async function sendMail({ to, bcc, subject, html, text, attachments = [] }) {
+    if (!mailConfigured()) {
+        console.warn('Email skipped: GMAIL_USER / GMAIL_PASS not set.');
+        return false;
+    }
+    try {
+        await transporter.sendMail({
+            from: `"SvayamExpense" <${process.env.GMAIL_USER}>`,
+            to,
+            bcc,
+            subject,
+            text,
+            html,
+            attachments
+        });
+        return true;
+    } catch (error) {
+        console.error('Email send error:', error.message);
+        return false;
+    }
+}
 
 /**
  * HTML email when standard spending crosses 90% of monthly category budget (admins only).
- * @param {string[]} adminEmails
- * @param {{ categoryName: string, periodLabel: string, month: number, year: number, allocated: number, spent: number, remaining: number, usagePercent: number, currency: string }} detail
  */
 export const sendBudget90PercentAlert = async (adminEmails, detail) => {
-    if (!mailConfigured()) {
-        console.warn('Budget alert email skipped: GMAIL_USER / GMAIL_PASS not set.');
-        return false;
-    }
     const list = (Array.isArray(adminEmails) ? adminEmails : [])
         .map((e) => String(e).trim())
         .filter(Boolean);
@@ -45,95 +205,138 @@ export const sendBudget90PercentAlert = async (adminEmails, detail) => {
     const usage = Number(detail.usagePercent);
     const usageStr = Number.isFinite(usage) ? usage.toFixed(1) : '—';
 
-    const subject = `Svayam — Budget alert: ${detail.categoryName} has reached ${usageStr}% of monthly allocation`;
+    const subject = `SvayamExpense — Budget alert: ${detail.categoryName} at ${usageStr}%`;
 
-    const outer = 'font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif;background-color:#f4f6fb;margin:0;padding:32px 12px;';
-    const card =
-        'max-width:560px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);';
-    const header =
-        'background:linear-gradient(135deg,#1e3a5f 0%,#2563eb 100%);color:#ffffff;padding:28px 32px;text-align:left;';
-    const h1 = 'margin:0;font-size:22px;font-weight:600;line-height:1.3;letter-spacing:-0.02em;';
-    const sub = 'margin:10px 0 0;font-size:15px;opacity:0.92;line-height:1.5;font-weight:400;';
-    const bodyPad = 'padding:28px 32px 32px;color:#1e293b;font-size:15px;line-height:1.6;';
-    const pill =
-        'display:inline-block;background:#fef3c7;color:#92400e;font-size:13px;font-weight:600;padding:6px 12px;border-radius:999px;margin-bottom:18px;';
-    const table = 'width:100%;border-collapse:collapse;margin:20px 0;font-size:14px;';
-    const th = 'text-align:left;padding:10px 12px;border-bottom:1px solid #e2e8f0;color:#64748b;font-weight:600;';
-    const td = 'text-align:left;padding:12px;border-bottom:1px solid #f1f5f9;color:#0f172a;';
-    const tdStrong = 'font-weight:600;color:#1e40af;';
-    const foot = 'padding:0 32px 28px;font-size:12px;color:#94a3b8;line-height:1.5;';
+    const headline = `Budget threshold reached`;
+    const sublineHtml = `Standard spending for <strong style="color:#334155;">${escapeHtml(detail.categoryName)}</strong> has reached <strong style="color:#334155;">${escapeHtml(usageStr)}%</strong> of the allocated amount for <strong style="color:#334155;">${escapeHtml(detail.periodLabel)}</strong>. Roughly <strong style="color:#334155;">${escapeHtml(fmt(detail.remaining))}</strong> remains before the full allocation is used.`;
 
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="${outer}">
-  <div style="${card}">
-    <div style="${header}">
-      <p style="${h1}">Monthly budget threshold reached</p>
-      <p style="${sub}">Standard spending for <strong style="font-weight:600;">${escapeHtml(detail.categoryName)}</strong> has reached <strong>${escapeHtml(usageStr)}%</strong> of the allocated amount for <strong>${escapeHtml(detail.periodLabel)}</strong>. Only about <strong>${fmt(detail.remaining)}</strong> remains before the ceiling.</p>
-    </div>
-    <div style="${bodyPad}">
-      <span style="${pill}">90% allocation used</span>
-      <p style="margin:0 0 8px;">Summary for this category and period:</p>
-      <table role="presentation" style="${table}">
-        <tr><th style="${th}">Allocated</th><td style="${td}">${fmt(detail.allocated)}</td></tr>
-        <tr><th style="${th}">Spent (standard)</th><td style="${td} ${tdStrong}">${fmt(detail.spent)}</td></tr>
-        <tr><th style="${th}">Remaining</th><td style="${td}">${fmt(detail.remaining)}</td></tr>
-        <tr><th style="${th}">Usage</th><td style="${td} ${tdStrong}">${escapeHtml(usageStr)}%</td></tr>
-      </table>
-      <p style="margin:24px 0 0;color:#475569;">Please review this category in the <strong>Svayam Expense</strong> admin dashboard and adjust budgets or spending if needed.</p>
-    </div>
-    <div style="${foot}">
-      This is an automated message from Svayam Expense Tracker. Do not reply to this email.
-    </div>
-  </div>
-</body>
-</html>`;
+    const cardTitle = detail.categoryName;
+    const cardSubtitle = 'Category & billing period';
+    const cardIntroHtml = `Please review this line in the <strong>SvayamExpense</strong> admin dashboard. You can adjust budgets or follow up on spending if needed.`;
+
+    const rows = [
+        { label: 'Period', valueHtml: escapeHtml(detail.periodLabel) },
+        { label: 'Allocated', valueHtml: escapeHtml(fmt(detail.allocated)) },
+        { label: 'Spent (standard)', valueHtml: escapeHtml(fmt(detail.spent)) },
+        { label: 'Remaining', valueHtml: escapeHtml(fmt(detail.remaining)) },
+        { label: 'Usage', valueHtml: `${escapeHtml(usageStr)}%` }
+    ];
+
+    const footerHtml = `This is an automated message from SvayamExpense. Please do not reply to this email.`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml
+    });
 
     const text = [
-        `Monthly budget threshold reached (${usageStr}% used).`,
+        `Budget threshold reached (${usageStr}% used).`,
         `Category: ${detail.categoryName}`,
         `Period: ${detail.periodLabel}`,
         `Allocated: ${fmt(detail.allocated)} | Spent (standard): ${fmt(detail.spent)} | Remaining: ${fmt(detail.remaining)}`,
         '',
-        'Review budgets in the Svayam Expense admin dashboard.'
+        'Review in the SvayamExpense admin dashboard.'
     ].join('\n');
 
     const to = list[0];
     const bcc = list.length > 1 ? list.slice(1) : undefined;
-
-    try {
-        await transporter.sendMail({
-            from: `"Svayam Expense" <${process.env.GMAIL_USER}>`,
-            to,
-            bcc,
-            subject,
-            text,
-            html
-        });
-        return true;
-    } catch (error) {
-        console.error('Budget 90% email error:', error.message);
-        return false;
-    }
+    return sendMail({ to, bcc, subject, html, text, attachments });
 };
 
-function escapeHtml(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+/**
+ * Email OTP: verification (signup flow) or password reset — same professional layout.
+ * @param {'verify' | 'reset'} [purpose]
+ */
+export const sendEmailOTP = async (to, otp, purpose = 'verify') => {
+    const isReset = purpose === 'reset';
+    const subject = isReset
+        ? 'Reset your password — SvayamExpense'
+        : 'Verify your email — SvayamExpense';
 
-export const sendEmailOTP = async (to, otp) => {
-    try {
-        await transporter.sendMail({
-            from: `"Svayam Tracker" <${process.env.GMAIL_USER}>`,
-            to: to,
-            subject: "Verify Your Email - Svayam Tracker",
-            text: `Your verification OTP is: ${otp}. It is valid for 10 minutes.`,
-            html: `<b>Your verification OTP is: ${otp}</b><p>Valid for 10 minutes.</p>`
-        });
-        return true;
-    } catch (error) {
-        console.error("Email Error:", error);
-        return false;
-    }
+    const headline = isReset ? `Reset your password` : `Verify your email`;
+    const sublineHtml = isReset
+        ? `We received a request to reset the password for your SvayamExpense account. Use the one-time code below. If you did not request this, you can ignore this email.`
+        : `Thanks for choosing <strong style="color:#334155;">SvayamExpense</strong>. Enter the verification code below to confirm your email and continue registration. This helps us keep your account secure.`;
+
+    const cardTitle = isReset ? 'Password reset' : 'Email verification';
+    const cardSubtitle = isReset ? 'Your reset code' : 'Your verification code';
+    const cardIntroHtml = isReset
+        ? `This code expires in <strong>10 minutes</strong>. After resetting, use your new password to sign in.`
+        : `You are one step away from activating your workspace. This code expires in <strong>10 minutes</strong>.`;
+
+    const rows = [
+        {
+            label: 'Code',
+            valueHtml: `<span style="font-size:22px;letter-spacing:0.18em;font-family:Consolas,Monaco,monospace;">${escapeHtml(String(otp))}</span>`
+        },
+        { label: 'Valid for', valueHtml: escapeHtml('10 minutes') },
+        { label: 'Status', valueHtml: escapeHtml(isReset ? 'Action required' : 'Pending verification') }
+    ];
+
+    const footerHtml = `If you did not request this email, you can safely ignore it. &mdash; SvayamExpense`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml
+    });
+
+    const text = isReset
+        ? `SvayamExpense password reset\n\nYour OTP: ${otp}\nValid for 10 minutes.\n\nIf you did not request a reset, ignore this email.`
+        : `SvayamExpense email verification\n\nYour OTP: ${otp}\nValid for 10 minutes.\n\nEnter this code to verify your email and complete signup.`;
+
+    return sendMail({ to, subject, html, text, attachments });
+};
+
+/**
+ * After successful registration (profile completed) — onboarding welcome.
+ */
+export const sendWelcomeOnboardingEmail = async (to, name) => {
+    const safeName = String(name || 'there').trim() || 'there';
+    const subject = `Welcome to SvayamExpense, ${safeName}`;
+
+    const headline = `Welcome aboard, ${escapeHtml(safeName)}!`;
+    const sublineHtml = `Your account is <strong style="color:#334155;">active</strong>. SvayamExpense helps teams log expenses, stay within monthly budgets, and keep finance visibility in one place. Here is how to get started.`;
+
+    const cardTitle = 'Your quick start';
+    const cardSubtitle = 'Next steps in the app';
+    const cardIntroHtml = `Use the same email and password you just set to <strong>sign in</strong>. Then explore logging expenses, attaching receipts where needed, and checking category spend against your organization&rsquo;s monthly budgets.`;
+
+    const rows = [
+        { label: 'Account', valueHtml: escapeHtml('Active') },
+        { label: 'Focus', valueHtml: escapeHtml('Expenses & monthly budgets') },
+        { label: 'Tip', valueHtml: escapeHtml('Keep expense dates accurate for correct month buckets.') }
+    ];
+
+    const footerHtml = `Questions? Reach your organization admin. This is an automated message from SvayamExpense.`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml
+    });
+
+    const text = [
+        `Welcome to SvayamExpense, ${safeName}!`,
+        '',
+        'Your account is active. Sign in with your email and password.',
+        'Log expenses, attach receipts, and track spend against monthly category budgets.',
+        '',
+        '— SvayamExpense'
+    ].join('\n');
+
+    return sendMail({ to, subject, html, text, attachments });
 };

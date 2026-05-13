@@ -116,7 +116,7 @@ export const forgotPassword = async (req, res) => {
         }
 
         // Gmail ke zariye OTP bhejna
-        await sendEmailOTP(email, genOtp);
+        await sendEmailOTP(email, genOtp, 'reset');
         res.json({ message: "Reset OTP sent to your email. Valid for 10 minutes." });
     } catch (error) {
         res.status(500).json({ error: error.message });
