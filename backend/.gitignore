@@ -6,6 +6,8 @@ apihelper.txt
 # Receipt uploads (multer: backend/src/public/receipts)
 public/receipts/
 src/public/receipts/
+# OCR temp uploads (normally deleted after scan)
+src/temp/receipt-scan/
 
 # Debug logs
 npm-debug.log*

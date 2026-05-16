@@ -2,6 +2,9 @@ import { pool } from '../db/index.js';
 import Tesseract from 'tesseract.js';
 import { sendExpenseReportPdf } from '../utils/expenseReportPdf.js';
 import { fireBudget90Alert, fireBudget90AlertAfterUpdate } from '../utils/budgetThresholdAlert.js';
+import { selectRowArray, isMissingDeletedAtColumnError } from '../utils/mariaRows.js';
+import { createNotification } from '../utils/notifications.js';
+import { activeCategoryWhere } from '../utils/categoryArchive.js';
 
 /** MariaDB driver often returns insertId / INT columns as BigInt; JSON.stringify cannot serialize BigInt */
 const jsonNumber = (v) => (typeof v === 'bigint' ? Number(v) : v);
@@ -10,6 +13,36 @@ const rowToJson = (row) =>
     Object.fromEntries(
         Object.entries(row).map(([k, v]) => [k, typeof v === 'bigint' ? Number(v) : v])
     );
+
+/** Explicit list — avoids `e.*` + JOIN where `categories.description` overwrites `expenses.description`. */
+const EXPENSE_LIST_SELECT = `
+  e.id, e.title, e.category_id, e.user_id, e.amount, e.currency,
+  e.payment_method, e.vendor, e.receipt_path,
+  e.description AS expense_description,
+  e.expense_date, e.expense_type, e.created_at`;
+
+/** DB column is `description`; FE often sends/reads `notes`. */
+const expenseNotesFromBody = (body) => {
+    const v = body?.description ?? body?.notes;
+    if (v === undefined || v === null) return null;
+    const s = String(v).trim();
+    return s === "" ? null : s;
+};
+
+const mapExpenseRowWithCategoryMeta = (raw) => {
+    const r = rowToJson(raw);
+    if (r.expense_description !== undefined) {
+        r.description = r.expense_description;
+        delete r.expense_description;
+    }
+    r.notes = r.description ?? null;
+    if (Object.prototype.hasOwnProperty.call(r, 'category_archived')) {
+        const archived = Number(r.category_archived) === 1 || r.category_archived === true;
+        r.category_archived = archived;
+        r.category_status = archived ? 'history_only' : 'active';
+    }
+    return r;
+};
 
 /**
  * 1. ADD EXPENSE
@@ -20,11 +53,12 @@ const rowToJson = (row) =>
 
 /**
  * CREATE EXPENSE (Final Version)
- * Features: 
+ * Features:
  * 1. Transaction-based safety
  * 2. Admin-only 'extra' bypass logic
  * 3. Real-time budget exceed check
  * 4. Safe data extraction (Optional Chaining)
+ * 5. Multipart `receipt` is optional and unrelated to POST /scan-receipt: OCR uses a temp file that is deleted; to persist this image on the expense, the client must send `receipt` again on this create request.
  */
 export const addExpense = async (req, res) => {
     const {
@@ -33,10 +67,10 @@ export const addExpense = async (req, res) => {
         amount: rawAmount,
         payment_method,
         vendor,
-        description,
         expense_date,
         expense_type
     } = req.body;
+    const description = expenseNotesFromBody(req.body);
 
     const category_id =
         rawCategoryId === undefined || rawCategoryId === '' ? rawCategoryId : parseInt(String(rawCategoryId), 10);
@@ -77,8 +111,18 @@ export const addExpense = async (req, res) => {
             return res.status(400).json({ status: "error", message: "amount must be a valid non-negative number." });
         }
 
-        const catRaw = await connection.query("SELECT id FROM categories WHERE id = ?", [category_id]);
-        const catRows = Array.isArray(catRaw[0]) ? catRaw[0] : catRaw;
+        let catRows;
+        try {
+            const catRaw = await connection.query(
+                "SELECT id FROM categories WHERE id = ? AND deleted_at IS NULL",
+                [category_id]
+            );
+            catRows = Array.isArray(catRaw[0]) ? catRaw[0] : catRaw;
+        } catch (e) {
+            if (!isMissingDeletedAtColumnError(e)) throw e;
+            const catRaw = await connection.query("SELECT id FROM categories WHERE id = ?", [category_id]);
+            catRows = Array.isArray(catRaw[0]) ? catRaw[0] : catRaw;
+        }
         if (!catRows?.length) {
             await connection.rollback();
             return res.status(400).json({
@@ -150,7 +194,23 @@ export const addExpense = async (req, res) => {
             [title, category_id, user_id, amount, payment_method, vendor, receipt_path, description, finalDate, expense_type || 'standard']
         );
 
-        // 5. Commit Transaction
+        const userRows = selectRowArray(
+            await connection.query("SELECT name FROM users WHERE id = ?", [user_id])
+        );
+        const catRowsForMsg = selectRowArray(
+            await connection.query("SELECT name FROM categories WHERE id = ?", [category_id])
+        );
+        const user_name = userRows[0]?.name ?? "User";
+        const category_name = catRowsForMsg[0]?.name ?? "category";
+
+        await createNotification(
+            user_id,
+            jsonNumber(insertResult.insertId),
+            "expense_created",
+            `${user_name} added a new expense of ₹${amount} in ${category_name}`,
+            connection
+        );
+
         await connection.commit();
 
         if (standardBudgetSnapshot) {
@@ -212,23 +272,70 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
     }
 
     const offset = (page - 1) * limit;
-    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
 
-    const dataSql = `
-        SELECT e.*, u.name as user_name, c.name as category_name 
-        FROM expenses e 
-        JOIN users u ON e.user_id = u.id 
-        JOIN categories c ON e.category_id = c.id 
+    const buildDataSql = (useDeletedAt, activeClauses, activeParams) => {
+        const allClauses = [...activeClauses];
+        const allParams = [...activeParams];
+        if (useDeletedAt) {
+            allClauses.push(activeCategoryWhere("c"));
+        }
+        const whereSql = allClauses.length > 0 ? `WHERE ${allClauses.join(" AND ")}` : "";
+        return {
+            whereSql,
+            sql: `
+        SELECT ${EXPENSE_LIST_SELECT}, u.name as user_name, c.name as category_name
+        FROM expenses e
+        JOIN users u ON e.user_id = u.id
+        JOIN categories c ON e.category_id = c.id
         ${whereSql}
-        ORDER BY ${sortCol} ${orderDir}, e.id DESC 
+        ORDER BY ${sortCol} ${orderDir}, e.id DESC
         LIMIT ? OFFSET ?
-    `;
+    `,
+            params: allParams,
+        };
+    };
 
-    const countSql = `SELECT COUNT(*) as total FROM expenses e JOIN users u ON e.user_id = u.id ${whereSql}`;
+    const buildCountSql = (useDeletedAt, activeClauses, activeParams) => {
+        const allClauses = [...activeClauses];
+        const allParams = [...activeParams];
+        if (useDeletedAt) {
+            allClauses.push(activeCategoryWhere("c"));
+        }
+        const whereSql = allClauses.length > 0 ? `WHERE ${allClauses.join(" AND ")}` : "";
+        return {
+            whereSql,
+            sql: `SELECT COUNT(*) as total FROM expenses e
+        JOIN users u ON e.user_id = u.id
+        JOIN categories c ON e.category_id = c.id
+        ${whereSql}`,
+            params: allParams,
+        };
+    };
 
-    const rows = await pool.query(dataSql, [...params, limit, offset]);
-    const countRows = await pool.query(countSql, params);
-    const total = Number(countRows[0]?.total ?? 0);
+    const runQuery = async (useDeletedAt) => {
+        const data = buildDataSql(useDeletedAt, clauses, params);
+        const count = buildCountSql(useDeletedAt, clauses, params);
+        const rawRows = await pool.query(data.sql, [...data.params, limit, offset]);
+        const rawCount = await pool.query(count.sql, count.params);
+        return {
+            rows: selectRowArray(rawRows),
+            countRows: selectRowArray(rawCount),
+        };
+    };
+
+    let rows;
+    let countRows;
+    try {
+        ({ rows, countRows } = await runQuery(true));
+    } catch (e) {
+        if (isMissingDeletedAtColumnError(e)) {
+            ({ rows, countRows } = await runQuery(false));
+        } else {
+            throw e;
+        }
+    }
+
+    const total = Number(jsonNumber(countRows[0]?.total ?? 0));
 
     const basePagination = {
         totalItems: total,
@@ -237,7 +344,13 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
     };
 
     const result = {
-        data: Array.isArray(rows) ? rows.map(rowToJson) : rows,
+        scope: "active",
+        data: rows.map((row) => {
+            const r = mapExpenseRowWithCategoryMeta(row);
+            r.category_status = "active";
+            r.category_archived = false;
+            return r;
+        }),
         pagination: isMy ? { ...basePagination, limit } : basePagination
     };
 
@@ -284,8 +397,12 @@ export const getAllExpenses = async (req, res) => {
 export const getUserExpenses = async (req, res) => {
     try {
         const { category_id } = req.query;
+        const uid = jsonNumber(req.user.id);
+        if (!Number.isFinite(uid)) {
+            return res.status(401).json({ message: 'Invalid user session' });
+        }
         let whereClauses = ["e.user_id = ?"];
-        let queryParams = [req.user.id];
+        let queryParams = [uid];
 
         if (category_id) {
             whereClauses.push("e.category_id = ?");
@@ -319,7 +436,8 @@ export const  searchExpensesByUserName = async (req, res) => {
 };
 
 /**
- * 3. UPDATE & DELETE — owner or admin; only admin may set type to extra
+ * 3. UPDATE & DELETE — owner or admin; only admin may set type to extra.
+ * Multipart PUT with `receipt` replaces stored file; scan-receipt does not feed this route automatically.
  */
 export const updateExpense = async (req, res) => {
     const id = parseInt(req.params.id, 10);
@@ -329,11 +447,11 @@ export const updateExpense = async (req, res) => {
         title,
         amount: rawAmount,
         category_id: rawCategoryId,
-        description,
         expense_type,
         payment_method,
         vendor
     } = req.body;
+    const description = expenseNotesFromBody(req.body);
 
     const category_id =
         rawCategoryId === undefined || rawCategoryId === ''
@@ -364,6 +482,25 @@ export const updateExpense = async (req, res) => {
             return res.status(403).json({ message: 'Not allowed to update this expense' });
         }
 
+        const prevCat = jsonNumber(existingRow.category_id);
+        if (category_id !== prevCat) {
+            let catList;
+            try {
+                const catRows = await pool.query(
+                    'SELECT id FROM categories WHERE id = ? AND deleted_at IS NULL',
+                    [category_id]
+                );
+                catList = selectRowArray(catRows);
+            } catch (e) {
+                if (!isMissingDeletedAtColumnError(e)) throw e;
+                const catRows = await pool.query('SELECT id FROM categories WHERE id = ?', [category_id]);
+                catList = selectRowArray(catRows);
+            }
+            if (!catList.length) {
+                return res.status(400).json({ status: 'error', message: 'Invalid or archived category_id.' });
+            }
+        }
+
         const isAdmin = req.user.role === 'admin';
         const typeVal = expense_type || 'standard';
         const newReceipt = req.file ? req.file.filename : null;
@@ -386,9 +523,32 @@ export const updateExpense = async (req, res) => {
                 : [title, amount, category_id, description, typeVal, payment_method ?? null, vendor ?? null, id, req.user.id];
         }
 
-        const result = await pool.query(sql, params);
-        const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
-        if (affected === 0) return res.status(404).json({ message: 'Expense not found or not updated' });
+        const actorLabel = req.user.name || req.user.email || `User #${jsonNumber(req.user.id)}`;
+
+        const conn = await pool.getConnection();
+        try {
+            await conn.beginTransaction();
+            const result = await conn.query(sql, params);
+            const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
+            if (affected === 0) {
+                await conn.rollback();
+                return res.status(404).json({ message: 'Expense not found or not updated' });
+            }
+
+            await createNotification(
+                ownerId,
+                id,
+                'expense_updated',
+                `${actorLabel} updated expense #${id}: ${title ?? ''} — ₹${amount}`,
+                conn
+            );
+            await conn.commit();
+        } catch (e) {
+            await conn.rollback();
+            throw e;
+        } finally {
+            conn.release();
+        }
 
         fireBudget90AlertAfterUpdate(existingRow, {
             amount,
@@ -407,11 +567,12 @@ export const deleteExpense = async (req, res) => {
     if (!Number.isFinite(id)) return res.status(400).json({ message: 'Invalid expense id' });
 
     try {
-        const existing = await pool.query('SELECT user_id FROM expenses WHERE id = ?', [id]);
-        const rows = Array.isArray(existing) ? existing : [];
+        const existingRaw = await pool.query('SELECT user_id, title FROM expenses WHERE id = ?', [id]);
+        const rows = selectRowArray(existingRaw);
         if (!rows.length) return res.status(404).json({ message: 'Expense not found' });
 
         const ownerId = jsonNumber(rows[0].user_id);
+        const deletedTitle = String(rows[0].title ?? '').trim();
         if (req.user.role !== 'admin' && ownerId !== jsonNumber(req.user.id)) {
             return res.status(403).json({ message: 'Not allowed to delete this expense' });
         }
@@ -420,9 +581,32 @@ export const deleteExpense = async (req, res) => {
         const sql = isAdmin ? 'DELETE FROM expenses WHERE id = ?' : 'DELETE FROM expenses WHERE id = ? AND user_id = ?';
         const params = isAdmin ? [id] : [id, req.user.id];
 
-        const result = await pool.query(sql, params);
-        const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
-        if (affected === 0) return res.status(404).json({ message: 'Expense not found' });
+        const actorLabel = req.user.name || req.user.email || `User #${jsonNumber(req.user.id)}`;
+
+        const conn = await pool.getConnection();
+        try {
+            await conn.beginTransaction();
+            const result = await conn.query(sql, params);
+            const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
+            if (affected === 0) {
+                await conn.rollback();
+                return res.status(404).json({ message: 'Expense not found' });
+            }
+
+            await createNotification(
+                ownerId,
+                null,
+                'expense_deleted',
+                `${actorLabel} deleted expense #${id}${deletedTitle ? `: ${deletedTitle}` : ''}`,
+                conn
+            );
+            await conn.commit();
+        } catch (e) {
+            await conn.rollback();
+            throw e;
+        } finally {
+            conn.release();
+        }
 
         res.json({ message: 'Deleted successfully' });
     } catch (error) {
@@ -446,19 +630,36 @@ const parseReportFilters = (req) => {
     return { month: m, year: y, category_id: cat };
 };
 
-const fetchExpensesForPdf = async (whereSql, params) => {
-    const sql = `
+const fetchExpensesForPdf = async (whereBody, params) => {
+    const buildSql = (useDeletedAt) => {
+        const extra = useDeletedAt ? ` AND ${activeCategoryWhere("c")}` : "";
+        return `
         SELECT e.expense_date, e.title, e.amount, e.payment_method, e.expense_type,
+               e.description AS expense_description,
                c.name AS category_name, u.name AS user_name
         FROM expenses e
         JOIN categories c ON e.category_id = c.id
         JOIN users u ON e.user_id = u.id
-        ${whereSql}
+        WHERE ${whereBody}${extra}
         ORDER BY e.expense_date DESC, e.id DESC
     `;
-    const rows = await pool.query(sql, params);
-    const list = Array.isArray(rows) ? rows : [];
-    return list.map(rowToJson);
+    };
+    let rows;
+    try {
+        rows = selectRowArray(await pool.query(buildSql(true), params));
+    } catch (e) {
+        if (isMissingDeletedAtColumnError(e)) {
+            rows = selectRowArray(await pool.query(buildSql(false), params));
+        } else {
+            throw e;
+        }
+    }
+    return rows.map((row) => {
+        const r = mapExpenseRowWithCategoryMeta(row);
+        r.category_status = "active";
+        r.category_archived = false;
+        return r;
+    });
 };
 
 /**
@@ -470,18 +671,18 @@ export const downloadMyExpenseReportPdf = async (req, res) => {
         const parsed = parseReportFilters(req);
         if (parsed.error) return res.status(400).json({ message: parsed.error });
 
-        let where = 'WHERE e.user_id = ?';
+        const whereParts = ['e.user_id = ?'];
         const params = [req.user.id];
         if (parsed.month != null) {
-            where += ' AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?';
+            whereParts.push('MONTH(e.expense_date) = ?', 'YEAR(e.expense_date) = ?');
             params.push(parsed.month, parsed.year);
         }
         if (parsed.category_id != null) {
-            where += ' AND e.category_id = ?';
+            whereParts.push('e.category_id = ?');
             params.push(parsed.category_id);
         }
 
-        const rows = await fetchExpensesForPdf(where, params);
+        const rows = await fetchExpensesForPdf(whereParts.join(' AND '), params);
         const period =
             parsed.month != null
                 ? `Period: ${parsed.year}-${String(parsed.month).padStart(2, '0')}`
@@ -506,18 +707,18 @@ export const downloadAdminExpenseReportPdf = async (req, res) => {
         const parsed = parseReportFilters(req);
         if (parsed.error) return res.status(400).json({ message: parsed.error });
 
-        let where = 'WHERE 1=1';
+        const whereParts = ['1=1'];
         const params = [];
         if (parsed.month != null) {
-            where += ' AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?';
+            whereParts.push('MONTH(e.expense_date) = ?', 'YEAR(e.expense_date) = ?');
             params.push(parsed.month, parsed.year);
         }
         if (parsed.category_id != null) {
-            where += ' AND e.category_id = ?';
+            whereParts.push('e.category_id = ?');
             params.push(parsed.category_id);
         }
 
-        const rows = await fetchExpensesForPdf(where, params);
+        const rows = await fetchExpensesForPdf(whereParts.join(' AND '), params);
         const period =
             parsed.month != null
                 ? `Period: ${parsed.year}-${String(parsed.month).padStart(2, '0')}`

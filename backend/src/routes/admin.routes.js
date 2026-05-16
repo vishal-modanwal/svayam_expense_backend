@@ -11,8 +11,24 @@ import {
     toggleUserStatus,
     updateBudget
 } from "../controllers/admin.controllers.js";
+import {
+    getNotifications,
+    getUnreadNotificationCount,
+    markAllNotificationsRead
+} from "../controllers/notification.controller.js";
+import {
+    getArchivedBudgets,
+    getArchivedCategories,
+    getArchivedExpenses
+} from "../controllers/archived.controllers.js";
 
 const router = Router();
+router.route("/archived/categories").get(auth, adminOnly, getArchivedCategories);
+router.route("/archived/expenses").get(auth, adminOnly, getArchivedExpenses);
+router.route("/archived/budgets").get(auth, adminOnly, getArchivedBudgets);
+router.route('/notifications/unread-count').get(auth, adminOnly, getUnreadNotificationCount);
+router.route('/notifications/read-all').patch(auth, adminOnly, markAllNotificationsRead);
+router.route('/notifications').get(auth, adminOnly, getNotifications);
 router.route('/toggle/:id').patch(auth , adminOnly, toggleUserStatus);
 router.route('/users-details').get(auth, adminOnly, getUsersDetails);
 router.route('/CategoryBudget').post(auth , adminOnly , createCategoryWithBudget);

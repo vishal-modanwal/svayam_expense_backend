@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { pool } from '../db/index.js';
+import { selectRowArray } from '../utils/mariaRows.js';
 
 /**
  * AUTH MIDDLEWARE
@@ -18,9 +19,8 @@ export const auth = async (req, res, next) => {
             const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
             // 3. Fetch user from DB to ensure they still exist and are active
-            const rows = await pool.query(
-                "SELECT id, name, email, role FROM users WHERE id = ?",
-                [decoded.id]
+            const rows = selectRowArray(
+                await pool.query("SELECT id, name, email, role FROM users WHERE id = ?", [decoded.id])
             );
 
             if (rows.length === 0) {
@@ -29,15 +29,15 @@ export const auth = async (req, res, next) => {
 
             // 4. Attach user to request object
             req.user = rows[0];
-            next();
+            return next();
         } catch (error) {
             console.error("Auth Middleware Error:", error.message);
-            res.status(401).json({ message: "Not authorized, token failed" });
+            return res.status(401).json({ message: "Not authorized, token failed" });
         }
     }
 
     if (!token) {
-        res.status(401).json({ message: "Not authorized, no token provided" });
+        return res.status(401).json({ message: "Not authorized, no token provided" });
     }
 };
 

@@ -33,7 +33,9 @@ CREATE TABLE categories (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(100) NOT NULL UNIQUE,
     description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    deleted_at DATETIME NULL DEFAULT NULL,
+    INDEX idx_categories_deleted_at (deleted_at)
 );
 
 -- 3. MONTHLY BUDGETS
@@ -75,6 +77,18 @@ CREATE TABLE expenses (
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+-- =========================================================
+-- INDEXES (MariaDB) — list/join/budget filters; LIKE '%..%' still limited
+-- =========================================================
+-- Admin dashboard slices: role + is_active on users
+CREATE INDEX idx_users_role_active ON users (role, is_active);
+
+-- My-expenses + ordering: user_id + expense_date; optional category_id filter uses user_id prefix
+CREATE INDEX idx_expenses_user_exp_date ON expenses (user_id, expense_date);
+
+-- Budget sums & category-scoped reads: category + type + date range
+CREATE INDEX idx_expenses_category_type_exp_date ON expenses (category_id, expense_type, expense_date);
+
 -- 5. ANALYTICS VIEW
 -- Real-time calculation for WebSocket threshold (80%) alerts[cite: 1]
 CREATE VIEW category_summary AS
@@ -102,3 +116,25 @@ INSERT INTO users (name, email, mobile_no, password, role, is_active, is_verifie
 VALUES ('Super Admin', 'admin@svayam.com', '9999999999', '$2b$10$6uVSrlrInAkWIS46V8TGrus/fUVtLV5xbuzB58x6EDIF8QXOyzoAa', 'admin', 1, 1);
 
 INSERT INTO categories (name) VALUES ('Marketing'), ('IT Infrastructure'), ('Travel'), ('Office Supplies');
+
+-- =========================================================
+-- IDEMPOTENT UPGRADE: categories soft-delete (same DDL as `categories` above)
+-- Legacy DBs missing deleted_at: this block adds column + index. Re-run safe on fresh DBs too.
+-- ADD COLUMN IF NOT EXISTS: MariaDB 10.0.2+. CREATE INDEX IF NOT EXISTS: MariaDB 10.5.2+
+-- (older MariaDB: run ALTER manually if needed; skip CREATE INDEX if idx already exists).
+-- =========================================================
+ALTER TABLE categories
+    ADD COLUMN IF NOT EXISTS deleted_at DATETIME NULL DEFAULT NULL AFTER created_at;
+
+CREATE INDEX IF NOT EXISTS idx_categories_deleted_at ON categories (deleted_at);
+
+
+CREATE TABLE notifications (
+  id         INT PRIMARY KEY AUTO_INCREMENT,
+  user_id    INT REFERENCES users(id) ON DELETE CASCADE,
+  expense_id INT REFERENCES expenses(id) ON DELETE SET NULL,
+  type       VARCHAR(50) NOT NULL,
+  message    TEXT NOT NULL,
+  is_read    BOOLEAN DEFAULT false,
+  created_at TIMESTAMP DEFAULT now()
+);
