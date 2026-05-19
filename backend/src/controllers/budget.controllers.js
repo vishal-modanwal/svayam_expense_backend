@@ -1,10 +1,13 @@
 import { pool } from "../db/index.js";
-import { selectRowArray, isMissingDeletedAtColumnError } from "../utils/mariaRows.js";
-import { activeCategoryWhere } from "../utils/categoryArchive.js";
+import { selectRowArray, isMissingArchivedColumnError } from "../utils/mariaRows.js";
+import {
+    activeCategoryWhere,
+    activeBudgetWhere,
+    activeExpenseWhere,
+} from "../utils/categoryArchive.js";
 
 /**
- * GET BUDGET BY MONTH & YEAR
- * Query params se month aur year lekar specific budget details return karta hai.
+ * GET BUDGET BY MONTH & YEAR — active (archived=no) rows only.
  */
 export const getBudgetByPeriod = async (req, res) => {
     const { month, year } = req.query;
@@ -14,28 +17,23 @@ export const getBudgetByPeriod = async (req, res) => {
     }
 
     try {
-        const buildSql = (withActiveFilter) => {
-            const catFilter = withActiveFilter ? ` AND ${activeCategoryWhere("c")}` : "";
-            return `SELECT b.*, c.name as category_name,
+        const rows = selectRowArray(
+            await pool.query(
+                `SELECT b.*, c.name as category_name,
                     (SELECT SUM(amount) FROM expenses e
                      WHERE e.category_id = b.category_id
-                     AND MONTH(e.created_at) = b.month
-                     AND YEAR(e.created_at) = b.year) AS total_spent
+                     AND e.archived = 'no'
+                     AND MONTH(e.expense_date) = b.month
+                     AND YEAR(e.expense_date) = b.year) AS total_spent
              FROM monthly_budgets b
              JOIN categories c ON b.category_id = c.id
-             WHERE b.month = ? AND b.year = ?${catFilter}`;
-        };
-
-        let rows;
-        try {
-            rows = selectRowArray(await pool.query(buildSql(true), [month, year]));
-        } catch (e) {
-            if (isMissingDeletedAtColumnError(e)) {
-                rows = selectRowArray(await pool.query(buildSql(false), [month, year]));
-            } else {
-                throw e;
-            }
-        }
+             WHERE b.month = ? AND b.year = ?
+               AND ${activeBudgetWhere("b")}
+               AND ${activeCategoryWhere("c")}
+             ORDER BY c.name ASC`,
+                [month, year]
+            )
+        );
 
         if (rows.length === 0) {
             return res.status(404).json({ message: "No budget found for the selected period." });
@@ -45,6 +43,7 @@ export const getBudgetByPeriod = async (req, res) => {
             ...row,
             category_archived: false,
             category_status: "active",
+            archived: false,
         }));
 
         res.json({
@@ -53,6 +52,12 @@ export const getBudgetByPeriod = async (req, res) => {
             budgets,
         });
     } catch (error) {
+        if (isMissingArchivedColumnError(error)) {
+            return res.status(503).json({
+                message: "Run Schema.sql archived upgrade, then retry.",
+                code: "SCHEMA_MISSING_archived",
+            });
+        }
         res.status(500).json({ error: error.message });
     }
 };

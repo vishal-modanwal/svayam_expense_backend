@@ -9,7 +9,16 @@ export function selectRowArray(raw) {
     return raw;
 }
 
-/** True when DB error is unknown column related to `deleted_at` (soft-delete not migrated yet). */
+/** True when DB error is unknown column related to `archived` (migration not applied). */
+export function isMissingArchivedColumnError(err) {
+    const msg = String(err?.message ?? "");
+    return (
+        (err?.errno === 1054 || err?.sqlState === "42S22") &&
+        /\b(archived|archive_reason|deleted_at|deleted_by)\b/i.test(msg)
+    );
+}
+
+/** @deprecated Use isMissingArchivedColumnError — legacy `deleted_at` migrations */
 export function isMissingDeletedAtColumnError(err) {
     const msg = String(err?.message ?? "");
     return (err?.errno === 1054 || err?.sqlState === "42S22") && /deleted_at/i.test(msg);

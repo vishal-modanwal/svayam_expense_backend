@@ -119,7 +119,7 @@ export async function notifyAfterExpenseUpdateIfNeeded(existingRow, nextFields, 
         const sumRaw = await poolConn.query(
             `SELECT COALESCE(SUM(amount), 0) AS total_spent
              FROM expenses
-             WHERE category_id = ? AND expense_type = 'standard'
+             WHERE category_id = ? AND expense_type = 'standard' AND archived = 'no'
                AND MONTH(expense_date) = ? AND YEAR(expense_date) = ?`,
             [bucket.categoryId, bucket.month, bucket.year]
         );
@@ -132,7 +132,7 @@ export async function notifyAfterExpenseUpdateIfNeeded(existingRow, nextFields, 
 
         const budRaw = await poolConn.query(
             `SELECT allocated_amount, currency FROM monthly_budgets
-             WHERE category_id = ? AND month = ? AND year = ?`,
+             WHERE category_id = ? AND month = ? AND year = ? AND archived = 'no'`,
             [bucket.categoryId, bucket.month, bucket.year]
         );
         const budRows = asRows(budRaw);

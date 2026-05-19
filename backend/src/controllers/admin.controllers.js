@@ -1,6 +1,14 @@
 import { pool } from "../db/index.js";
-import { selectRowArray, isMissingDeletedAtColumnError } from "../utils/mariaRows.js";
-import { activeCategoryWhere, activeExpenseCategoryExists } from "../utils/categoryArchive.js";
+import { selectRowArray, isMissingArchivedColumnError } from "../utils/mariaRows.js";
+import {
+    activeCategoryWhere,
+    activeBudgetWhere,
+    activeExpenseWhere,
+    activeExpenseCategoryExists,
+    ARCHIVED_NO,
+    ARCHIVED_YES,
+} from "../utils/categoryArchive.js";
+import { archiveCategoryCascade } from "../utils/archiveCategory.js";
 
 /** True when (year, month) is strictly before the current calendar month (same rule as budget create). */
 const isPastBudgetPeriod = (year, month) => {
@@ -62,19 +70,30 @@ export const createCategoryWithBudget = async (req, res) => {
         connection = await pool.getConnection();
         await connection.beginTransaction();
 
+        const dup = selectRowArray(
+            await connection.query(
+                "SELECT id FROM categories WHERE name = ? AND archived = ? LIMIT 1",
+                [name, ARCHIVED_NO]
+            )
+        );
+        if (dup.length > 0) {
+            await connection.rollback();
+            return res.status(400).json({ message: "This category already exists." });
+        }
+
         // Step 1: Create Category
         const catResult = await connection.query(
-            "INSERT INTO categories (name, description) VALUES (?, ?)",
-            [name, description]
+            "INSERT INTO categories (name, description, archived) VALUES (?, ?, ?)",
+            [name, description, ARCHIVED_NO]
         );
         const result = Array.isArray(catResult) ? catResult[0] : catResult;
         const category_id = result.insertId;
 
         // Step 2: Set Monthly Budget for this new category
         await connection.query(
-            `INSERT INTO monthly_budgets (category_id, month, year, allocated_amount, currency, created_by)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [category_id, month, year, allocated_amount, currency || 'INR', admin_id]
+            `INSERT INTO monthly_budgets (category_id, month, year, allocated_amount, currency, created_by, archived)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [category_id, month, year, allocated_amount, currency || "INR", admin_id, ARCHIVED_NO]
         );
 
         // Sab sahi raha toh commit karein
@@ -106,15 +125,16 @@ const num = (v) => (typeof v === 'bigint' ? Number(v) : Number(v || 0));
 export const getTotalBudgetsSummary = async (req, res) => {
     try {
         const activeCat = activeCategoryWhere("c");
+        const activeBud = activeBudgetWhere("b");
         const activeExp = activeExpenseCategoryExists("e");
         const sql = `
             SELECT
                 (SELECT COALESCE(SUM(b.allocated_amount), 0) FROM monthly_budgets b
                  INNER JOIN categories c ON c.id = b.category_id AND ${activeCat}
-                 WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE())) AS total_allocated,
+                 WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE()) AND ${activeBud}) AS total_allocated,
                 (SELECT COUNT(*) FROM monthly_budgets b
                  INNER JOIN categories c ON c.id = b.category_id AND ${activeCat}
-                 WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE())) AS budget_category_count,
+                 WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE()) AND ${activeBud}) AS budget_category_count,
 
                 (SELECT COALESCE(SUM(e.amount), 0) FROM expenses e
                  WHERE e.expense_type = 'standard'
@@ -140,13 +160,14 @@ export const getTotalBudgetsSummary = async (req, res) => {
 
                 (SELECT COUNT(*) FROM (
                     SELECT
-                        (b.allocated_amount - COALESCE(SUM(CASE WHEN e.expense_type = 'standard' THEN e.amount ELSE 0 END), 0)) AS rem
+                        (b.allocated_amount - COALESCE(SUM(CASE WHEN e.expense_type = 'standard' AND e.archived = 'no' THEN e.amount ELSE 0 END), 0)) AS rem
                     FROM monthly_budgets b
                     INNER JOIN categories c ON c.id = b.category_id AND ${activeCat}
                     LEFT JOIN expenses e ON e.category_id = b.category_id
+                        AND e.archived = 'no'
                         AND MONTH(e.expense_date) = b.month
                         AND YEAR(e.expense_date) = b.year
-                    WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE())
+                    WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE()) AND ${activeBud}
                     GROUP BY b.id, b.allocated_amount
                     HAVING rem > 0
                 ) t) AS categories_with_remaining_count
@@ -283,7 +304,7 @@ export const getUsersDetails = async (req, res) => {
                 COALESCE(SUM(e.amount), 0) AS total_expenses,
                 COUNT(e.id) AS expense_record_count
             FROM users u
-            LEFT JOIN expenses e ON e.user_id = u.id
+            LEFT JOIN expenses e ON e.user_id = u.id AND ${activeExpenseWhere("e")}
             ${whereSql}
             GROUP BY u.id, u.name, u.email, u.mobile_no, u.is_active, u.created_at
             ORDER BY ${orderBy} ${orderDir}, u.id DESC
@@ -372,7 +393,7 @@ export const getCategoryWiseBudgets = async (req, res) => {
         const search = String(req.query.search ?? "").trim();
 
         const stdSum =
-            "COALESCE(SUM(CASE WHEN e.expense_type = 'standard' THEN e.amount ELSE 0 END), 0)";
+            `COALESCE(SUM(CASE WHEN e.expense_type = 'standard' AND ${activeExpenseWhere("e")} THEN e.amount ELSE 0 END), 0)`;
         const sortMap = {
             latest: "b.id",
             budget_id: "b.id",
@@ -396,7 +417,9 @@ export const getCategoryWiseBudgets = async (req, res) => {
 
         const buildWhere = (withActiveFilter) => {
             const parts = [...whereParts];
-            if (withActiveFilter) parts.push(activeCategoryWhere("c"));
+            if (withActiveFilter) {
+                parts.push(activeCategoryWhere("c"), activeBudgetWhere("b"));
+            }
             return parts.join(" AND ");
         };
 
@@ -417,42 +440,27 @@ export const getCategoryWiseBudgets = async (req, res) => {
                     THEN ROUND((${stdSum} / b.allocated_amount) * 100, 2)
                     ELSE 0 
                 END AS usage_percentage,
-                COUNT(CASE WHEN e.expense_type = 'standard' THEN 1 END) AS standard_transaction_count,
-                COUNT(CASE WHEN e.expense_type = 'extra' THEN 1 END) AS extra_transaction_count
+                COUNT(CASE WHEN e.expense_type = 'standard' AND e.archived = 'no' THEN 1 END) AS standard_transaction_count,
+                COUNT(CASE WHEN e.expense_type = 'extra' AND e.archived = 'no' THEN 1 END) AS extra_transaction_count
             FROM monthly_budgets b
             JOIN categories c ON c.id = b.category_id
             LEFT JOIN expenses e ON e.category_id = b.category_id 
                 AND MONTH(e.expense_date) = b.month 
                 AND YEAR(e.expense_date) = b.year
             WHERE ${whereSql}
-            GROUP BY b.id, b.category_id, c.name, c.description, b.month, b.year, b.allocated_amount, b.currency
+            GROUP BY b.id, b.category_id, c.name, c.description, b.month, b.year, b.allocated_amount, b.currency, b.archived
             ORDER BY ${orderBySql}
             LIMIT ? OFFSET ?
         `;
 
-        let whereSql;
-        let rows;
-        let totalRecords;
-        try {
-            whereSql = buildWhere(true);
-            const countRaw = await pool.query(
-                `SELECT COUNT(*) AS total_records FROM monthly_budgets b
-                 JOIN categories c ON c.id = b.category_id WHERE ${whereSql}`,
-                baseParams
-            );
-            totalRecords = num(selectRowArray(countRaw)[0]?.total_records);
-            rows = await pool.query(dataSql(whereSql), [...baseParams, limit, offset]);
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            whereSql = buildWhere(false);
-            const countRaw = await pool.query(
-                `SELECT COUNT(*) AS total_records FROM monthly_budgets b
-                 JOIN categories c ON c.id = b.category_id WHERE ${whereSql}`,
-                baseParams
-            );
-            totalRecords = num(selectRowArray(countRaw)[0]?.total_records);
-            rows = await pool.query(dataSql(whereSql), [...baseParams, limit, offset]);
-        }
+        const whereSql = buildWhere(true);
+        const countRaw = await pool.query(
+            `SELECT COUNT(*) AS total_records FROM monthly_budgets b
+             JOIN categories c ON c.id = b.category_id WHERE ${whereSql}`,
+            baseParams
+        );
+        const totalRecords = num(selectRowArray(countRaw)[0]?.total_records);
+        const rows = await pool.query(dataSql(whereSql), [...baseParams, limit, offset]);
         const list = selectRowArray(rows);
         const data = list.map((row) => ({
             budget_id: num(row.budget_id),
@@ -550,8 +558,8 @@ export const getDashboardExpensesByView = async (req, res) => {
         }
 
         const baseWhere = where.join(" AND ");
-        const buildDashSql = (withActiveFilter) => {
-            const catFilter = withActiveFilter ? ` AND ${activeCategoryWhere("c")}` : "";
+        const buildDashSql = () => {
+            const liveFilter = ` AND ${activeCategoryWhere("c")} AND ${activeExpenseWhere("e")}`;
             return `
             SELECT
                 e.id,
@@ -575,35 +583,21 @@ export const getDashboardExpensesByView = async (req, res) => {
             FROM expenses e
             JOIN users u ON u.id = e.user_id
             JOIN categories c ON c.id = e.category_id
-            WHERE ${baseWhere}${catFilter}
+            WHERE ${baseWhere}${liveFilter}
             ORDER BY ${sortBy} ${orderDir}, e.id DESC
             LIMIT ? OFFSET ?
         `;
         };
 
-        let rows;
-        let totalRecords;
-        try {
-            rows = await pool.query(buildDashSql(true), [...params, limit, offset]);
-            const countRaw = await pool.query(
-                `SELECT COUNT(*) AS total_records FROM expenses e
-                 JOIN users u ON u.id = e.user_id
-                 JOIN categories c ON c.id = e.category_id
-                 WHERE ${baseWhere} AND ${activeCategoryWhere("c")}`,
-                params
-            );
-            totalRecords = num(selectRowArray(countRaw)?.[0]?.total_records);
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            rows = await pool.query(buildDashSql(false), [...params, limit, offset]);
-            const countRaw = await pool.query(
-                `SELECT COUNT(*) AS total_records FROM expenses e
-                 JOIN users u ON u.id = e.user_id
-                 WHERE ${baseWhere}`,
-                params
-            );
-            totalRecords = num(selectRowArray(countRaw)?.[0]?.total_records);
-        }
+        const rows = await pool.query(buildDashSql(), [...params, limit, offset]);
+        const countRaw = await pool.query(
+            `SELECT COUNT(*) AS total_records FROM expenses e
+             JOIN users u ON u.id = e.user_id
+             JOIN categories c ON c.id = e.category_id
+             WHERE ${baseWhere} AND ${activeCategoryWhere("c")} AND ${activeExpenseWhere("e")}`,
+            params
+        );
+        const totalRecords = num(selectRowArray(countRaw)?.[0]?.total_records);
         const list = selectRowArray(rows);
 
         res.json({
@@ -676,16 +670,15 @@ export const updateBudget = async (req, res) => {
     }
 
     try {
-        let pre;
-        try {
-            const preRows = await pool.query(
-                `SELECT
+        const preRows = await pool.query(
+            `SELECT
                 b.id,
                 b.month,
                 b.year,
+                b.archived AS budget_archived,
                 b.currency AS existing_currency,
-                c.deleted_at AS category_deleted_at,
-                COALESCE(SUM(CASE WHEN e.expense_type = 'standard' THEN e.amount ELSE 0 END), 0) AS standard_spent,
+                c.archived AS category_archived,
+                COALESCE(SUM(CASE WHEN e.expense_type = 'standard' AND e.archived = 'no' THEN e.amount ELSE 0 END), 0) AS standard_spent,
                 COUNT(e.id) AS expense_row_count
             FROM monthly_budgets b
             JOIN categories c ON c.id = b.category_id
@@ -693,38 +686,17 @@ export const updateBudget = async (req, res) => {
                 AND MONTH(e.expense_date) = b.month
                 AND YEAR(e.expense_date) = b.year
             WHERE b.id = ?
-            GROUP BY b.id, b.month, b.year, b.currency, c.deleted_at`,
-                [budgetId]
-            );
-            const preList = selectRowArray(preRows);
-            pre = preList[0];
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            const preRows = await pool.query(
-                `SELECT
-                b.id,
-                b.month,
-                b.year,
-                b.currency AS existing_currency,
-                COALESCE(SUM(CASE WHEN e.expense_type = 'standard' THEN e.amount ELSE 0 END), 0) AS standard_spent,
-                COUNT(e.id) AS expense_row_count
-            FROM monthly_budgets b
-            LEFT JOIN expenses e ON e.category_id = b.category_id
-                AND MONTH(e.expense_date) = b.month
-                AND YEAR(e.expense_date) = b.year
-            WHERE b.id = ?
-            GROUP BY b.id, b.month, b.year, b.currency`,
-                [budgetId]
-            );
-            const preList = selectRowArray(preRows);
-            pre = preList[0];
-        }
+            GROUP BY b.id, b.month, b.year, b.currency, b.archived, c.archived`,
+            [budgetId]
+        );
+        const preList = selectRowArray(preRows);
+        const pre = preList[0];
         if (!pre) {
             return res.status(404).json({ message: "Budget not found" });
         }
-        if (pre.category_deleted_at != null) {
+        if (pre.category_archived === ARCHIVED_YES || pre.budget_archived === ARCHIVED_YES) {
             return res.status(400).json({
-                message: "Cannot update budget for an archived category. Use archived history APIs.",
+                message: "Cannot update an archived budget. Use archived history APIs.",
                 category_status: "history_only",
             });
         }
@@ -764,21 +736,16 @@ export const updateBudget = async (req, res) => {
         params.push(budgetId);
 
         const result = await pool.query(
-            `UPDATE monthly_budgets SET ${fields.join(", ")} WHERE id = ?`,
-            params
+            `UPDATE monthly_budgets SET ${fields.join(", ")} WHERE id = ? AND archived = ?`,
+            [...params, ARCHIVED_NO]
         );
         const affected = typeof result?.affectedRows === "number" ? result.affectedRows : 0;
         if (affected === 0) {
             return res.status(404).json({ message: "Budget not found" });
         }
 
-        const buildPostUpdateSql = (withArchive) => {
-            const arch = withArchive ? `(c.deleted_at IS NOT NULL) AS category_archived` : `0 AS category_archived`;
-            const groupBy = withArchive
-                ? `GROUP BY b.id, b.category_id, c.name, c.deleted_at, b.month, b.year, b.allocated_amount, b.currency`
-                : `GROUP BY b.id, b.category_id, c.name, b.month, b.year, b.allocated_amount, b.currency`;
-            return `
-            SELECT 
+        const rows = await pool.query(
+            `SELECT 
                 b.id AS budget_id,
                 b.category_id,
                 c.name AS category_name,
@@ -786,28 +753,17 @@ export const updateBudget = async (req, res) => {
                 b.year,
                 b.allocated_amount,
                 b.currency,
-                COALESCE(SUM(CASE WHEN e.expense_type = 'standard' THEN e.amount ELSE 0 END), 0) AS total_spent,
-                (b.allocated_amount - COALESCE(SUM(CASE WHEN e.expense_type = 'standard' THEN e.amount ELSE 0 END), 0)) AS remaining_amount,
-                ${arch}
+                COALESCE(SUM(CASE WHEN e.expense_type = 'standard' AND e.archived = 'no' THEN e.amount ELSE 0 END), 0) AS total_spent,
+                (b.allocated_amount - COALESCE(SUM(CASE WHEN e.expense_type = 'standard' AND e.archived = 'no' THEN e.amount ELSE 0 END), 0)) AS remaining_amount
             FROM monthly_budgets b
             JOIN categories c ON c.id = b.category_id
             LEFT JOIN expenses e ON e.category_id = b.category_id 
                 AND MONTH(e.expense_date) = b.month 
                 AND YEAR(e.expense_date) = b.year
             WHERE b.id = ?
-            ${groupBy}`;
-        };
-
-        let rows;
-        try {
-            rows = await pool.query(buildPostUpdateSql(true), [budgetId]);
-        } catch (e) {
-            if (isMissingDeletedAtColumnError(e)) {
-                rows = await pool.query(buildPostUpdateSql(false), [budgetId]);
-            } else {
-                throw e;
-            }
-        }
+            GROUP BY b.id, b.category_id, c.name, b.month, b.year, b.allocated_amount, b.currency`,
+            [budgetId]
+        );
         const rowArr = selectRowArray(rows);
         const row = rowArr[0];
         if (!row) {
@@ -825,8 +781,8 @@ export const updateBudget = async (req, res) => {
                 budget_id: num(row.budget_id),
                 category_id: num(row.category_id),
                 category_name: row.category_name,
-                category_archived: Boolean(num(row.category_archived)),
-                category_status: num(row.category_archived) === 1 ? "history_only" : "active",
+                category_archived: false,
+                category_status: "active",
                 month: num(row.month),
                 year: num(row.year),
                 allocated_amount: Number(row.allocated_amount),
@@ -841,9 +797,9 @@ export const updateBudget = async (req, res) => {
 };
 
 /**
- * DELETE a monthly budget row (monthly_budgets.id).
- * If no monthly_budgets rows remain for that category and the category has no expenses, soft-deletes the category (archived).
- * Rules: not for closed past months; blocked if any expense exists for that category in that month.
+ * ARCHIVE a monthly budget row (monthly_budgets.id → archived=yes).
+ * If no active budgets remain for that category and no active expenses, archives the whole category (cascade).
+ * Rules: not for closed past months; blocked if any active expense exists for that category in that month.
  */
 export const deleteBudget = async (req, res) => {
     const budgetId = parseInt(req.params.id, 10);
@@ -852,27 +808,32 @@ export const deleteBudget = async (req, res) => {
     }
 
     try {
-        const existing = await pool.query(
-            `SELECT
+        const existing = selectRowArray(
+            await pool.query(
+                `SELECT
                 b.id,
                 b.category_id,
                 b.month,
                 b.year,
-                COUNT(e.id) AS expense_row_count
+                b.archived AS budget_archived,
+                SUM(CASE WHEN e.archived = 'no' THEN 1 ELSE 0 END) AS expense_row_count
             FROM monthly_budgets b
             LEFT JOIN expenses e ON e.category_id = b.category_id
                 AND MONTH(e.expense_date) = b.month
                 AND YEAR(e.expense_date) = b.year
             WHERE b.id = ?
-            GROUP BY b.id, b.category_id, b.month, b.year`,
-            [budgetId]
+            GROUP BY b.id, b.category_id, b.month, b.year, b.archived`,
+                [budgetId]
+            )
         );
-        const rows = Array.isArray(existing) ? existing : [];
-        if (rows.length === 0) {
+        if (existing.length === 0) {
             return res.status(404).json({ message: "Budget not found" });
         }
 
-        const meta = rows[0];
+        const meta = existing[0];
+        if (meta.budget_archived === ARCHIVED_YES) {
+            return res.status(400).json({ message: "Budget is already archived." });
+        }
         const y = num(meta.year);
         const m = num(meta.month);
         if (isPastBudgetPeriod(y, m)) {
@@ -886,65 +847,71 @@ export const deleteBudget = async (req, res) => {
             });
         }
 
-        await pool.query("DELETE FROM monthly_budgets WHERE id = ?", [budgetId]);
+        await pool.query(
+            `UPDATE monthly_budgets SET archived = ? WHERE id = ? AND archived = ?`,
+            [ARCHIVED_YES, budgetId, ARCHIVED_NO]
+        );
 
         const categoryId = num(meta.category_id);
-        let categoryDeleted = false;
+        let categoryArchived = false;
         let categoryRetainedReason = null;
 
-        const remainingBudgets = await pool.query(
-            "SELECT COUNT(*) AS cnt FROM monthly_budgets WHERE category_id = ?",
-            [categoryId]
+        const remainingBudgets = selectRowArray(
+            await pool.query(
+                `SELECT COUNT(*) AS cnt FROM monthly_budgets WHERE category_id = ? AND archived = ?`,
+                [categoryId, ARCHIVED_NO]
+            )
         );
-        const rem = Array.isArray(remainingBudgets) ? remainingBudgets[0] : null;
-        const budgetCountLeft = num(rem?.cnt ?? rem?.CNT);
+        const budgetCountLeft = num(remainingBudgets[0]?.cnt);
 
         if (budgetCountLeft === 0) {
-            const linkedExpenses = await pool.query(
-                "SELECT id FROM expenses WHERE category_id = ? LIMIT 1",
-                [categoryId]
+            const linkedExpenses = selectRowArray(
+                await pool.query(
+                    `SELECT id FROM expenses WHERE category_id = ? AND archived = ? LIMIT 1`,
+                    [categoryId, ARCHIVED_NO]
+                )
             );
-            const expRows = Array.isArray(linkedExpenses) ? linkedExpenses : [];
-            if (expRows.length > 0) {
+            if (linkedExpenses.length > 0) {
                 categoryRetainedReason =
-                    "Category kept: expenses exist for this category. Remove or reassign expenses to delete the category.";
+                    "Category kept active: non-archived expenses still exist for this category.";
             } else {
+                const conn = await pool.getConnection();
                 try {
-                    const catUp = await pool.query(
-                        `UPDATE categories
-                         SET deleted_at = CURRENT_TIMESTAMP,
-                             name = CONCAT(SUBSTRING(TRIM(name), 1, 75), '·archived·', id)
-                         WHERE id = ? AND deleted_at IS NULL`,
-                        [categoryId]
+                    await conn.beginTransaction();
+                    const actorId = Number(req.user?.id);
+                    await archiveCategoryCascade(
+                        conn,
+                        categoryId,
+                        Number.isFinite(actorId) ? actorId : null
                     );
-                    const affectedCat =
-                        typeof catUp?.affectedRows === "number" ? catUp.affectedRows : 0;
-                    if (affectedCat > 0) {
-                        categoryDeleted = true;
-                    }
+                    await conn.commit();
+                    categoryArchived = true;
                 } catch (e) {
-                    if (isMissingDeletedAtColumnError(e)) {
+                    await conn.rollback();
+                    if (isMissingArchivedColumnError(e)) {
                         categoryRetainedReason =
-                            "Category not archived: add categories.deleted_at (run Schema.sql idempotent upgrade). Budget row was still deleted.";
+                            "Category not archived: run Schema.sql archived upgrade. Budget was still archived.";
                     } else {
                         throw e;
                     }
+                } finally {
+                    conn.release();
                 }
             }
         }
 
         const payload = {
             status: "success",
-            message: categoryDeleted
-                ? "Budget deleted; category archived successfully"
-                : "Budget deleted successfully",
-            deleted: {
+            message: categoryArchived
+                ? "Budget archived; category archived successfully"
+                : "Budget archived successfully",
+            archived: {
                 budget_id: budgetId,
                 category_id: categoryId,
                 month: num(meta.month),
-                year: num(meta.year)
+                year: num(meta.year),
             },
-            category_deleted: categoryDeleted
+            category_archived: categoryArchived,
         };
         if (categoryRetainedReason) {
             payload.category_retained_reason = categoryRetainedReason;

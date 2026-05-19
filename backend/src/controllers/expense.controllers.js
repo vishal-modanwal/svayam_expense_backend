@@ -2,9 +2,24 @@ import { pool } from '../db/index.js';
 import Tesseract from 'tesseract.js';
 import { sendExpenseReportPdf } from '../utils/expenseReportPdf.js';
 import { fireBudget90Alert, fireBudget90AlertAfterUpdate } from '../utils/budgetThresholdAlert.js';
-import { selectRowArray, isMissingDeletedAtColumnError } from '../utils/mariaRows.js';
+import { selectRowArray, isMissingArchivedColumnError } from '../utils/mariaRows.js';
 import { createNotification } from '../utils/notifications.js';
-import { activeCategoryWhere } from '../utils/categoryArchive.js';
+import {
+    activeCategoryWhere,
+    activeExpenseWhere,
+    ARCHIVED_NO,
+} from '../utils/categoryArchive.js';
+import { isArchivedYes } from '../utils/archiveCategory.js';
+import {
+    EXPENSE_ARCHIVE_REASON,
+    softArchiveExpenseById,
+} from '../utils/expenseArchive.js';
+import {
+    fetchUserMonthlyBudgetRow,
+    syncUserBudgetAfterExpenseChange,
+    fireUserBudgetSync,
+    monthYearFromExpenseDate,
+} from '../utils/userMonthlyBudget.js';
 
 /** MariaDB driver often returns insertId / INT columns as BigInt; JSON.stringify cannot serialize BigInt */
 const jsonNumber = (v) => (typeof v === 'bigint' ? Number(v) : v);
@@ -111,18 +126,11 @@ export const addExpense = async (req, res) => {
             return res.status(400).json({ status: "error", message: "amount must be a valid non-negative number." });
         }
 
-        let catRows;
-        try {
-            const catRaw = await connection.query(
-                "SELECT id FROM categories WHERE id = ? AND deleted_at IS NULL",
-                [category_id]
-            );
-            catRows = Array.isArray(catRaw[0]) ? catRaw[0] : catRaw;
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            const catRaw = await connection.query("SELECT id FROM categories WHERE id = ?", [category_id]);
-            catRows = Array.isArray(catRaw[0]) ? catRaw[0] : catRaw;
-        }
+        const catRaw = await connection.query(
+            `SELECT id FROM categories WHERE id = ? AND archived = ?`,
+            [category_id, ARCHIVED_NO]
+        );
+        const catRows = Array.isArray(catRaw[0]) ? catRaw[0] : catRaw;
         if (!catRows?.length) {
             await connection.rollback();
             return res.status(400).json({
@@ -131,60 +139,85 @@ export const addExpense = async (req, res) => {
             });
         }
 
-        // 2. Budget Validation (Standard Expenses ke liye)
-        if (expense_type !== 'extra') {
-            // Check Allocated Budget
-            // Note: MariaDB mein [rows] destructuring tabhi kaam karegi jab pool 'mysql2/promise' se bana ho
+        // 2. Budget validation (standard): category cap OR optional per-user monthly cap
+        const typeForBudget = expense_type || 'standard';
+        let userBudgetPayload = null;
+
+        if (typeForBudget !== 'extra') {
+            const { month: budgetMonth, year: budgetYear } = monthYearFromExpenseDate(finalDate);
+            const userBudgetRow =
+                budgetMonth != null
+                    ? await fetchUserMonthlyBudgetRow(connection, user_id, budgetMonth, budgetYear)
+                    : null;
+            const hasUserMonthlyBudget = !!userBudgetRow;
+
             const budgetResult = await connection.query(
                 `SELECT allocated_amount, currency FROM monthly_budgets 
-                 WHERE category_id = ? AND month = MONTH(?) AND year = YEAR(?)`,
-                [category_id, finalDate, finalDate]
+                 WHERE category_id = ? AND month = MONTH(?) AND year = YEAR(?) AND archived = ?`,
+                [category_id, finalDate, finalDate, ARCHIVED_NO]
             );
-
-            // Destructuring fix: Agar result array hai toh pehla element lein
             const budgetRows = Array.isArray(budgetResult[0]) ? budgetResult[0] : budgetResult;
 
-            if (!budgetRows || budgetRows.length === 0) {
-                await connection.rollback();
-                return res.status(400).json({ 
-                    status: "error",
-                    message: "Budget record not found! Pehle budget create karein." 
-                });
+            if (!hasUserMonthlyBudget) {
+                if (!budgetRows || budgetRows.length === 0) {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        status: "error",
+                        message: "Budget record not found! Pehle budget create karein.",
+                    });
+                }
+
+                const allocatedAmount = parseFloat(budgetRows[0].allocated_amount);
+                const budgetCurrency = budgetRows[0].currency || 'INR';
+
+                const spentResult = await connection.query(
+                    `SELECT SUM(amount) as total_spent FROM expenses 
+                     WHERE category_id = ? AND expense_type = 'standard' AND archived = ?
+                     AND MONTH(expense_date) = MONTH(?) AND YEAR(expense_date) = YEAR(?)`,
+                    [category_id, ARCHIVED_NO, finalDate, finalDate]
+                );
+                const spentRows = Array.isArray(spentResult[0]) ? spentResult[0] : spentResult;
+                const currentTotalSpent = parseFloat(spentRows[0]?.total_spent || 0);
+                const newAmount = parseFloat(amount);
+
+                if (currentTotalSpent + newAmount > allocatedAmount) {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        status: "error",
+                        message: "Budget Exceeded!",
+                        available: (allocatedAmount - currentTotalSpent).toFixed(2),
+                    });
+                }
+
+                standardBudgetSnapshot = {
+                    categoryId: category_id,
+                    expenseDate: finalDate,
+                    previousStandardSpentInBucket: currentTotalSpent,
+                    newStandardSpentInBucket: currentTotalSpent + newAmount,
+                    allocatedAmount,
+                    currency: budgetCurrency,
+                };
+            } else if (budgetRows?.length) {
+                const allocatedAmount = parseFloat(budgetRows[0].allocated_amount);
+                const budgetCurrency = budgetRows[0].currency || 'INR';
+                const spentResult = await connection.query(
+                    `SELECT SUM(amount) as total_spent FROM expenses 
+                     WHERE category_id = ? AND expense_type = 'standard' AND archived = ?
+                     AND MONTH(expense_date) = MONTH(?) AND YEAR(expense_date) = YEAR(?)`,
+                    [category_id, ARCHIVED_NO, finalDate, finalDate]
+                );
+                const spentRows = Array.isArray(spentResult[0]) ? spentResult[0] : spentResult;
+                const currentTotalSpent = parseFloat(spentRows[0]?.total_spent || 0);
+                const newAmount = parseFloat(amount);
+                standardBudgetSnapshot = {
+                    categoryId: category_id,
+                    expenseDate: finalDate,
+                    previousStandardSpentInBucket: currentTotalSpent,
+                    newStandardSpentInBucket: currentTotalSpent + newAmount,
+                    allocatedAmount,
+                    currency: budgetCurrency,
+                };
             }
-
-            const allocatedAmount = parseFloat(budgetRows[0].allocated_amount);
-            const budgetCurrency = budgetRows[0].currency || 'INR';
-
-            // Calculate current total spent
-            const spentResult = await connection.query(
-                `SELECT SUM(amount) as total_spent FROM expenses 
-                 WHERE category_id = ? AND expense_type = 'standard' 
-                 AND MONTH(expense_date) = MONTH(?) AND YEAR(expense_date) = YEAR(?)`,
-                [category_id, finalDate, finalDate]
-            );
-
-            const spentRows = Array.isArray(spentResult[0]) ? spentResult[0] : spentResult;
-            const currentTotalSpent = parseFloat(spentRows[0]?.total_spent || 0);
-            const newAmount = parseFloat(amount);
-
-            // 3. Exceed Check
-            if (currentTotalSpent + newAmount > allocatedAmount) {
-                await connection.rollback();
-                return res.status(400).json({ 
-                    status: "error",
-                    message: "Budget Exceeded!",
-                    available: (allocatedAmount - currentTotalSpent).toFixed(2)
-                });
-            }
-
-            standardBudgetSnapshot = {
-                categoryId: category_id,
-                expenseDate: finalDate,
-                previousStandardSpentInBucket: currentTotalSpent,
-                newStandardSpentInBucket: currentTotalSpent + newAmount,
-                allocatedAmount,
-                currency: budgetCurrency
-            };
         }
 
         // 4. Record Expense (MariaDB driver returns a single metadata object for INSERT, not [rows, fields])
@@ -203,13 +236,22 @@ export const addExpense = async (req, res) => {
         const user_name = userRows[0]?.name ?? "User";
         const category_name = catRowsForMsg[0]?.name ?? "category";
 
+        const newExpenseId = jsonNumber(insertResult.insertId);
         await createNotification(
             user_id,
-            jsonNumber(insertResult.insertId),
+            newExpenseId,
             "expense_created",
-            `${user_name} added a new expense of ₹${amount} in ${category_name}`,
+            `${user_name} added a new expense #${newExpenseId} of ₹${amount} in ${category_name}`,
             connection
         );
+
+        if (typeForBudget !== 'extra') {
+            userBudgetPayload = await syncUserBudgetAfterExpenseChange(connection, {
+                userId: user_id,
+                expenseDate: finalDate,
+                expenseType: typeForBudget,
+            });
+        }
 
         await connection.commit();
 
@@ -220,7 +262,8 @@ export const addExpense = async (req, res) => {
         res.status(201).json({ 
             status: "success", 
             message: "Expense created successfully", 
-            expenseId: jsonNumber(insertResult.insertId)
+            expenseId: jsonNumber(insertResult.insertId),
+            ...(userBudgetPayload || {}),
         });
 
     } catch (error) {
@@ -273,11 +316,11 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
 
     const offset = (page - 1) * limit;
 
-    const buildDataSql = (useDeletedAt, activeClauses, activeParams) => {
+    const buildDataSql = (useArchiveFilter, activeClauses, activeParams) => {
         const allClauses = [...activeClauses];
         const allParams = [...activeParams];
-        if (useDeletedAt) {
-            allClauses.push(activeCategoryWhere("c"));
+        if (useArchiveFilter) {
+            allClauses.push(activeCategoryWhere("c"), activeExpenseWhere("e"));
         }
         const whereSql = allClauses.length > 0 ? `WHERE ${allClauses.join(" AND ")}` : "";
         return {
@@ -295,11 +338,11 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
         };
     };
 
-    const buildCountSql = (useDeletedAt, activeClauses, activeParams) => {
+    const buildCountSql = (useArchiveFilter, activeClauses, activeParams) => {
         const allClauses = [...activeClauses];
         const allParams = [...activeParams];
-        if (useDeletedAt) {
-            allClauses.push(activeCategoryWhere("c"));
+        if (useArchiveFilter) {
+            allClauses.push(activeCategoryWhere("c"), activeExpenseWhere("e"));
         }
         const whereSql = allClauses.length > 0 ? `WHERE ${allClauses.join(" AND ")}` : "";
         return {
@@ -312,9 +355,9 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
         };
     };
 
-    const runQuery = async (useDeletedAt) => {
-        const data = buildDataSql(useDeletedAt, clauses, params);
-        const count = buildCountSql(useDeletedAt, clauses, params);
+    const runQuery = async (useArchiveFilter) => {
+        const data = buildDataSql(useArchiveFilter, clauses, params);
+        const count = buildCountSql(useArchiveFilter, clauses, params);
         const rawRows = await pool.query(data.sql, [...data.params, limit, offset]);
         const rawCount = await pool.query(count.sql, count.params);
         return {
@@ -328,11 +371,13 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
     try {
         ({ rows, countRows } = await runQuery(true));
     } catch (e) {
-        if (isMissingDeletedAtColumnError(e)) {
-            ({ rows, countRows } = await runQuery(false));
-        } else {
-            throw e;
+        if (isMissingArchivedColumnError(e)) {
+            const err = new Error("Run Schema.sql archived upgrade, then retry.");
+            err.code = "SCHEMA_MISSING_archived";
+            err.status = 503;
+            throw err;
         }
+        throw e;
     }
 
     const total = Number(jsonNumber(countRows[0]?.total ?? 0));
@@ -382,7 +427,10 @@ export const getAllExpenses = async (req, res) => {
         const result = await fetchExpenses(whereClauses, queryParams, req.query);
         res.json({ status: "success", ...result });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        const status = error.status || 500;
+        res.status(status).json(
+            error.code ? { message: error.message, code: error.code } : { error: error.message }
+        );
     }
 };
 
@@ -412,7 +460,10 @@ export const getUserExpenses = async (req, res) => {
         const result = await fetchExpenses(whereClauses, queryParams, req.query, { mode: "my" });
         res.json({ status: "success", ...result });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        const status = error.status || 500;
+        res.status(status).json(
+            error.code ? { message: error.message, code: error.code } : { error: error.message }
+        );
     }
 };
 
@@ -431,7 +482,10 @@ export const  searchExpensesByUserName = async (req, res) => {
         const result = await fetchExpenses(whereClauses, queryParams, req.query);
         res.json({ status: "success", ...result });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        const status = error.status || 500;
+        res.status(status).json(
+            error.code ? { message: error.message, code: error.code } : { error: error.message }
+        );
     }
 };
 
@@ -482,20 +536,24 @@ export const updateExpense = async (req, res) => {
             return res.status(403).json({ message: 'Not allowed to update this expense' });
         }
 
+        const expMeta = selectRowArray(
+            await pool.query('SELECT archived FROM expenses WHERE id = ?', [id])
+        );
+        if (expMeta.length && isArchivedYes(expMeta[0].archived)) {
+            return res.status(400).json({
+                message: 'Cannot update an archived expense (history only).',
+                category_status: 'history_only',
+            });
+        }
+
         const prevCat = jsonNumber(existingRow.category_id);
         if (category_id !== prevCat) {
-            let catList;
-            try {
-                const catRows = await pool.query(
-                    'SELECT id FROM categories WHERE id = ? AND deleted_at IS NULL',
-                    [category_id]
-                );
-                catList = selectRowArray(catRows);
-            } catch (e) {
-                if (!isMissingDeletedAtColumnError(e)) throw e;
-                const catRows = await pool.query('SELECT id FROM categories WHERE id = ?', [category_id]);
-                catList = selectRowArray(catRows);
-            }
+            const catList = selectRowArray(
+                await pool.query(
+                    'SELECT id FROM categories WHERE id = ? AND archived = ?',
+                    [category_id, ARCHIVED_NO]
+                )
+            );
             if (!catList.length) {
                 return res.status(400).json({ status: 'error', message: 'Invalid or archived category_id.' });
             }
@@ -535,11 +593,15 @@ export const updateExpense = async (req, res) => {
                 return res.status(404).json({ message: 'Expense not found or not updated' });
             }
 
+            const catRowsForMsg = selectRowArray(
+                await conn.query('SELECT name FROM categories WHERE id = ?', [category_id])
+            );
+            const category_name = catRowsForMsg[0]?.name ?? 'category';
             await createNotification(
                 ownerId,
                 id,
                 'expense_updated',
-                `${actorLabel} updated expense #${id}: ${title ?? ''} — ₹${amount}`,
+                `${actorLabel} updated expense #${id} of ₹${amount} in ${category_name}`,
                 conn
             );
             await conn.commit();
@@ -556,6 +618,12 @@ export const updateExpense = async (req, res) => {
             expense_type: typeVal
         });
 
+        fireUserBudgetSync(pool, {
+            userId: ownerId,
+            expenseDate: existingRow.expense_date,
+            expenseType: typeVal,
+        });
+
         res.json({ message: 'Updated successfully' });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -566,40 +634,85 @@ export const deleteExpense = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isFinite(id)) return res.status(400).json({ message: 'Invalid expense id' });
 
+    const permanent =
+        req.query.permanent === 'true' ||
+        req.query.permanent === '1' ||
+        req.query.hard === 'true' ||
+        req.query.hard === '1';
+
     try {
-        const existingRaw = await pool.query('SELECT user_id, title FROM expenses WHERE id = ?', [id]);
+        const existingRaw = await pool.query(
+            'SELECT user_id, title, archived, amount, category_id, expense_date, expense_type FROM expenses WHERE id = ?',
+            [id]
+        );
         const rows = selectRowArray(existingRaw);
         if (!rows.length) return res.status(404).json({ message: 'Expense not found' });
 
+        const isAdmin = req.user.role === 'admin';
+        const alreadyArchived = isArchivedYes(rows[0].archived);
+
+        if (permanent && !isAdmin) {
+            return res.status(403).json({ message: 'Only admin can permanently delete an expense.' });
+        }
+        if (!permanent && alreadyArchived) {
+            return res.status(400).json({ message: 'Expense is already archived (history only).' });
+        }
+
         const ownerId = jsonNumber(rows[0].user_id);
-        const deletedTitle = String(rows[0].title ?? '').trim();
-        if (req.user.role !== 'admin' && ownerId !== jsonNumber(req.user.id)) {
+        const deletedAmount = parseFloat(String(rows[0].amount ?? ''));
+        const deletedCategoryId = jsonNumber(rows[0].category_id);
+        if (!isAdmin && ownerId !== jsonNumber(req.user.id)) {
             return res.status(403).json({ message: 'Not allowed to delete this expense' });
         }
 
-        const isAdmin = req.user.role === 'admin';
-        const sql = isAdmin ? 'DELETE FROM expenses WHERE id = ?' : 'DELETE FROM expenses WHERE id = ? AND user_id = ?';
-        const params = isAdmin ? [id] : [id, req.user.id];
-
-        const actorLabel = req.user.name || req.user.email || `User #${jsonNumber(req.user.id)}`;
+        const actorId = jsonNumber(req.user.id);
+        const actorLabel = req.user.name || req.user.email || `User #${actorId}`;
+        const archiveReason = isAdmin
+            ? EXPENSE_ARCHIVE_REASON.ADMIN_DELETED
+            : EXPENSE_ARCHIVE_REASON.USER_DELETED;
 
         const conn = await pool.getConnection();
         try {
             await conn.beginTransaction();
-            const result = await conn.query(sql, params);
-            const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
-            if (affected === 0) {
-                await conn.rollback();
-                return res.status(404).json({ message: 'Expense not found' });
+
+            const catRowsForMsg = selectRowArray(
+                await conn.query('SELECT name FROM categories WHERE id = ?', [deletedCategoryId])
+            );
+            const category_name = catRowsForMsg[0]?.name ?? 'category';
+
+            if (permanent) {
+                const sql = isAdmin
+                    ? 'DELETE FROM expenses WHERE id = ?'
+                    : 'DELETE FROM expenses WHERE id = ? AND user_id = ?';
+                const params = isAdmin ? [id] : [id, req.user.id];
+                const result = await conn.query(sql, params);
+                const affected = typeof result?.affectedRows === 'number' ? result.affectedRows : 0;
+                if (affected === 0) {
+                    await conn.rollback();
+                    return res.status(404).json({ message: 'Expense not found' });
+                }
+                await createNotification(
+                    ownerId,
+                    null,
+                    'expense_deleted',
+                    `${actorLabel} permanently deleted expense #${id} of ₹${deletedAmount} in ${category_name}`,
+                    conn
+                );
+            } else {
+                const affected = await softArchiveExpenseById(conn, id, archiveReason, actorId);
+                if (affected === 0) {
+                    await conn.rollback();
+                    return res.status(404).json({ message: 'Expense not found or already archived' });
+                }
+                await createNotification(
+                    ownerId,
+                    id,
+                    'expense_deleted',
+                    `${actorLabel} deleted expense #${id} of ₹${deletedAmount} in ${category_name}`,
+                    conn
+                );
             }
 
-            await createNotification(
-                ownerId,
-                null,
-                'expense_deleted',
-                `${actorLabel} deleted expense #${id}${deletedTitle ? `: ${deletedTitle}` : ''}`,
-                conn
-            );
             await conn.commit();
         } catch (e) {
             await conn.rollback();
@@ -608,7 +721,17 @@ export const deleteExpense = async (req, res) => {
             conn.release();
         }
 
-        res.json({ message: 'Deleted successfully' });
+        fireUserBudgetSync(pool, {
+            userId: ownerId,
+            expenseDate: rows[0].expense_date,
+            expenseType: rows[0].expense_type || 'standard',
+        });
+
+        res.json({
+            message: permanent ? 'Permanently deleted successfully' : 'Expense archived successfully',
+            permanent,
+            archived: !permanent,
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -631,29 +754,17 @@ const parseReportFilters = (req) => {
 };
 
 const fetchExpensesForPdf = async (whereBody, params) => {
-    const buildSql = (useDeletedAt) => {
-        const extra = useDeletedAt ? ` AND ${activeCategoryWhere("c")}` : "";
-        return `
+    const sql = `
         SELECT e.expense_date, e.title, e.amount, e.payment_method, e.expense_type,
                e.description AS expense_description,
                c.name AS category_name, u.name AS user_name
         FROM expenses e
         JOIN categories c ON e.category_id = c.id
         JOIN users u ON e.user_id = u.id
-        WHERE ${whereBody}${extra}
+        WHERE ${whereBody} AND ${activeCategoryWhere("c")} AND ${activeExpenseWhere("e")}
         ORDER BY e.expense_date DESC, e.id DESC
     `;
-    };
-    let rows;
-    try {
-        rows = selectRowArray(await pool.query(buildSql(true), params));
-    } catch (e) {
-        if (isMissingDeletedAtColumnError(e)) {
-            rows = selectRowArray(await pool.query(buildSql(false), params));
-        } else {
-            throw e;
-        }
-    }
+    const rows = selectRowArray(await pool.query(sql, params));
     return rows.map((row) => {
         const r = mapExpenseRowWithCategoryMeta(row);
         r.category_status = "active";

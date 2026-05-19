@@ -60,7 +60,9 @@ async function buildAdminOrgDataSnapshot() {
                 COALESCE(SUM(CASE WHEN e.expense_type = 'extra' THEN e.amount ELSE 0 END), 0) AS extra_total,
                 COUNT(*) AS cnt
              FROM expenses e
-             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?`,
+             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
+               AND e.archived = 'no'
+               AND EXISTS (SELECT 1 FROM categories c WHERE c.id = e.category_id AND c.archived = 'no')`,
             [month, year]
         );
         const aggRows = Array.isArray(aggRaw) ? aggRaw : [];
@@ -70,8 +72,10 @@ async function buildAdminOrgDataSnapshot() {
         const cnt = Number(agg.cnt ?? 0);
 
         const budgetRaw = await pool.query(
-            `SELECT COALESCE(SUM(allocated_amount), 0) AS total_allocated, COUNT(*) AS budget_lines
-             FROM monthly_budgets WHERE month = ? AND year = ?`,
+            `SELECT COALESCE(SUM(b.allocated_amount), 0) AS total_allocated, COUNT(*) AS budget_lines
+             FROM monthly_budgets b
+             INNER JOIN categories c ON c.id = b.category_id AND c.archived = 'no'
+             WHERE b.month = ? AND b.year = ? AND b.archived = 'no'`,
             [month, year]
         );
         const budgetRows = Array.isArray(budgetRaw) ? budgetRaw : [];
@@ -95,7 +99,8 @@ async function buildAdminOrgDataSnapshot() {
             `SELECT u.role, COALESCE(SUM(e.amount), 0) AS tot
              FROM expenses e
              JOIN users u ON u.id = e.user_id
-             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
+             JOIN categories c ON c.id = e.category_id AND c.archived = 'no'
+             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ? AND e.archived = 'no'
              GROUP BY u.role`,
             [month, year]
         );
@@ -107,8 +112,8 @@ async function buildAdminOrgDataSnapshot() {
         const topCatRaw = await pool.query(
             `SELECT c.name AS cat_name, COALESCE(SUM(e.amount), 0) AS tot
              FROM expenses e
-             JOIN categories c ON c.id = e.category_id
-             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
+             JOIN categories c ON c.id = e.category_id AND c.archived = 'no'
+             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ? AND e.archived = 'no'
              GROUP BY c.id, c.name
              ORDER BY tot DESC
              LIMIT 5`,
@@ -123,7 +128,8 @@ async function buildAdminOrgDataSnapshot() {
             `SELECT u.name AS user_name, COALESCE(SUM(e.amount), 0) AS tot
              FROM expenses e
              JOIN users u ON u.id = e.user_id
-             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
+             JOIN categories c ON c.id = e.category_id AND c.archived = 'no'
+             WHERE MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ? AND e.archived = 'no'
              GROUP BY u.id, u.name
              ORDER BY tot DESC
              LIMIT 5`,
@@ -137,8 +143,9 @@ async function buildAdminOrgDataSnapshot() {
         const recentRaw = await pool.query(
             `SELECT e.title, e.amount, e.expense_type, e.expense_date, c.name AS cat_name, u.name AS user_name
              FROM expenses e
-             JOIN categories c ON c.id = e.category_id
+             JOIN categories c ON c.id = e.category_id AND c.archived = 'no'
              JOIN users u ON u.id = e.user_id
+             WHERE e.archived = 'no'
              ORDER BY e.expense_date DESC, e.id DESC
              LIMIT 8`,
             []

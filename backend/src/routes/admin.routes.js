@@ -19,12 +19,26 @@ import {
 import {
     getArchivedBudgets,
     getArchivedCategories,
-    getArchivedExpenses
+    getArchivedExpenses,
+    restoreArchivedExpense,
 } from "../controllers/archived.controllers.js";
+import {
+    deleteUserMonthlyBudget,
+    getUserMonthlyBudgetById,
+    listUserMonthlyBudgets,
+    updateUserMonthlyBudgetById,
+    upsertUserMonthlyBudget,
+} from "../controllers/userMonthlyBudget.controllers.js";
 
 const router = Router();
 router.route("/archived/categories").get(auth, adminOnly, getArchivedCategories);
+router.route("/archived/expenses/:id/restore").patch(auth, adminOnly, restoreArchivedExpense);
 router.route("/archived/expenses").get(auth, adminOnly, getArchivedExpenses);
+router.route("/user-budgets/:id")
+    .get(auth, adminOnly, getUserMonthlyBudgetById)
+    .put(auth, adminOnly, updateUserMonthlyBudgetById)
+    .delete(auth, adminOnly, deleteUserMonthlyBudget);
+router.route("/user-budgets").get(auth, adminOnly, listUserMonthlyBudgets).post(auth, adminOnly, upsertUserMonthlyBudget);
 router.route("/archived/budgets").get(auth, adminOnly, getArchivedBudgets);
 router.route('/notifications/unread-count').get(auth, adminOnly, getUnreadNotificationCount);
 router.route('/notifications/read-all').patch(auth, adminOnly, markAllNotificationsRead);

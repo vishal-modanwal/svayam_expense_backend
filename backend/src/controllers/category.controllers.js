@@ -1,11 +1,12 @@
 import { pool } from "../db/index.js";
-import { isMissingDeletedAtColumnError } from "../utils/mariaRows.js";
+import { selectRowArray, isMissingArchivedColumnError } from "../utils/mariaRows.js";
+import { ARCHIVED_NO, ARCHIVED_YES, activeCategoryWhere, archivedCategoryWhere } from "../utils/categoryArchive.js";
+import { archiveCategoryCascade, isArchivedYes } from "../utils/archiveCategory.js";
 
 const num = (v) => (typeof v === "bigint" ? Number(v) : Number(v || 0));
 
-/** Option B: archived rows stay in DB for history; API exposes flags for FE (read-only vs active). */
 const mapCategoryRow = (row) => {
-    const archived = row.deleted_at != null;
+    const archived = isArchivedYes(row.archived);
     return {
         id: num(row.id),
         name: row.name,
@@ -17,110 +18,120 @@ const mapCategoryRow = (row) => {
 };
 
 /**
- * 1. GET ALL CATEGORIES — active only (archived: GET /api/admin/archived/categories).
+ * GET ALL CATEGORIES — active only (archived: GET /api/category/archived).
  */
 export const getAllCategories = async (req, res) => {
     try {
-        let rows;
-        try {
-            rows = await pool.query(
-                "SELECT id, name, description, created_at, deleted_at FROM categories WHERE deleted_at IS NULL ORDER BY name ASC"
-            );
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            rows = await pool.query(
-                "SELECT id, name, description, created_at FROM categories ORDER BY name ASC"
-            );
-        }
-
-        const list = Array.isArray(rows) ? rows : [];
+        const rows = selectRowArray(
+            await pool.query(
+                `SELECT id, name, description, created_at, archived
+                 FROM categories WHERE ${activeCategoryWhere("categories")}
+                 ORDER BY name ASC`
+            )
+        );
         res.json({
             status: "success",
             scope: "active",
-            data: list.map(mapCategoryRow),
+            data: rows.map(mapCategoryRow),
         });
     } catch (error) {
+        if (isMissingArchivedColumnError(error)) {
+            return res.status(503).json({
+                message: "Run the idempotent upgrade at the end of Schema.sql (archived columns), then retry.",
+                code: "SCHEMA_MISSING_archived",
+            });
+        }
         res.status(500).json({ error: error.message });
     }
 };
 
 /**
- * 2. GET SINGLE CATEGORY
- * Active: any authenticated user. Archived: admin only (history read); others get 404.
+ * GET ARCHIVED CATEGORIES (any authenticated user — read-only history).
+ */
+export const getArchivedCategoriesList = async (req, res) => {
+    try {
+        const rows = selectRowArray(
+            await pool.query(
+                `SELECT id, name, description, created_at, archived
+                 FROM categories
+                 WHERE ${archivedCategoryWhere("categories")}
+                 ORDER BY created_at DESC, id DESC`
+            )
+        );
+        res.json({
+            status: "success",
+            scope: "archived",
+            data: rows.map(mapCategoryRow),
+        });
+    } catch (error) {
+        if (isMissingArchivedColumnError(error)) {
+            return res.json({ status: "success", scope: "archived", data: [] });
+        }
+        res.status(500).json({ error: error.message });
+    }
+};
+
+/**
+ * GET SINGLE CATEGORY — active: any user; archived: any authenticated user (read-only).
  */
 export const getCategoryById = async (req, res) => {
     const { id } = req.params;
     try {
-        let list;
-        try {
-            const rows = await pool.query(
-                "SELECT id, name, description, created_at, deleted_at FROM categories WHERE id = ?",
+        const list = selectRowArray(
+            await pool.query(
+                `SELECT id, name, description, created_at, archived FROM categories WHERE id = ?`,
                 [id]
-            );
-            list = Array.isArray(rows) ? rows : [];
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            const rows = await pool.query(
-                "SELECT id, name, description, created_at FROM categories WHERE id = ?",
-                [id]
-            );
-            list = Array.isArray(rows) ? rows : [];
-        }
+            )
+        );
         if (list.length === 0) return res.status(404).json({ message: "Category not found" });
 
-        const row = list[0];
-        const archived = row.deleted_at != null;
-        if (archived && req.user?.role !== "admin") {
-            return res.status(404).json({ message: "Category not found" });
-        }
-
-        res.json({ status: "success", data: mapCategoryRow(row) });
+        res.json({ status: "success", data: mapCategoryRow(list[0]) });
     } catch (error) {
+        if (isMissingArchivedColumnError(error)) {
+            return res.status(503).json({
+                message: "Run Schema.sql archived upgrade, then retry.",
+                code: "SCHEMA_MISSING_archived",
+            });
+        }
         res.status(500).json({ error: error.message });
     }
 };
 
 /**
- * 3. UPDATE CATEGORY
- * Admin category ka naam ya description change kar sake.
+ * UPDATE CATEGORY (active only).
  */
 export const updateCategory = async (req, res) => {
     const { id } = req.params;
     const { name, description } = req.body;
 
     try {
-        let curList;
-        try {
-            const cur = await pool.query("SELECT deleted_at FROM categories WHERE id = ?", [id]);
-            curList = Array.isArray(cur) ? cur : [];
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            const cur = await pool.query("SELECT id FROM categories WHERE id = ?", [id]);
-            curList = Array.isArray(cur) ? cur : [];
-        }
+        const curList = selectRowArray(
+            await pool.query("SELECT archived FROM categories WHERE id = ?", [id])
+        );
         if (curList.length === 0) {
             return res.status(404).json({ message: "Category not found" });
         }
-        if (curList[0].deleted_at != null) {
+        if (isArchivedYes(curList[0].archived)) {
             return res.status(400).json({
                 message: "Cannot update an archived category (history only).",
                 category_status: "history_only",
             });
         }
 
-        let result;
-        try {
-            result = await pool.query(
-                "UPDATE categories SET name = ?, description = ? WHERE id = ? AND deleted_at IS NULL",
-                [name, description, id]
-            );
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            result = await pool.query(
-                "UPDATE categories SET name = ?, description = ? WHERE id = ?",
-                [name, description, id]
-            );
+        const dup = selectRowArray(
+            await pool.query(
+                `SELECT id FROM categories WHERE name = ? AND archived = ? AND id <> ? LIMIT 1`,
+                [name, ARCHIVED_NO, id]
+            )
+        );
+        if (dup.length > 0) {
+            return res.status(400).json({ message: "A category with this name already exists." });
         }
+
+        const result = await pool.query(
+            `UPDATE categories SET name = ?, description = ? WHERE id = ? AND archived = ?`,
+            [name, description, id, ARCHIVED_NO]
+        );
 
         if (result.affectedRows === 0) {
             return res.status(404).json({ message: "Category not found" });
@@ -136,63 +147,48 @@ export const updateCategory = async (req, res) => {
 };
 
 /**
- * 4. SOFT DELETE CATEGORY
- * Sets deleted_at; renames row to free UNIQUE(name) for a new category with the same label.
- * Linked expenses and monthly_budgets rows are kept for history.
+ * ARCHIVE CATEGORY — sets archived=yes on category, budgets, and expenses (name unchanged).
  */
 export const deleteCategory = async (req, res) => {
     const { id } = req.params;
 
+    let connection;
     try {
-        let rows;
-        try {
-            const existing = await pool.query("SELECT id, deleted_at FROM categories WHERE id = ?", [id]);
-            rows = Array.isArray(existing) ? existing : [];
-        } catch (e) {
-            if (!isMissingDeletedAtColumnError(e)) throw e;
-            return res.status(503).json({
-                message:
-                    "Category archive requires column categories.deleted_at. Run the idempotent upgrade at the end of Schema.sql, then retry.",
-                code: "SCHEMA_MISSING_deleted_at",
-            });
-        }
-        if (rows.length === 0) {
+        const existing = selectRowArray(
+            await pool.query("SELECT id, archived FROM categories WHERE id = ?", [id])
+        );
+        if (existing.length === 0) {
             return res.status(404).json({ message: "Category not found" });
         }
-        if (rows[0].deleted_at != null) {
+        if (isArchivedYes(existing[0].archived)) {
             return res.status(400).json({ message: "Category is already archived." });
         }
 
-        const result = await pool.query(
-            `UPDATE categories
-             SET deleted_at = CURRENT_TIMESTAMP,
-                 name = CONCAT(SUBSTRING(TRIM(name), 1, 75), '·archived·', id)
-             WHERE id = ? AND deleted_at IS NULL`,
-            [id]
-        );
-
-        const affected = typeof result?.affectedRows === "number" ? result.affectedRows : 0;
-        if (affected === 0) {
-            return res.status(404).json({ message: "Category not found" });
-        }
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const actorId = num(req.user?.id);
+        await archiveCategoryCascade(connection, id, Number.isFinite(actorId) ? actorId : null);
+        await connection.commit();
 
         res.json({
             message: "Category archived successfully.",
             archived: true,
             policy: {
-                expenses_and_budgets: "retained_for_history",
+                expenses_and_budgets: "marked_archived_for_history",
                 new_expenses_and_budget_assignments: "use_active_categories_only",
                 category_status: "history_only",
             },
         });
     } catch (error) {
-        if (isMissingDeletedAtColumnError(error)) {
+        if (connection) await connection.rollback();
+        if (isMissingArchivedColumnError(error)) {
             return res.status(503).json({
-                message:
-                    "Category archive requires column categories.deleted_at. Run the idempotent upgrade at the end of Schema.sql, then retry.",
-                code: "SCHEMA_MISSING_deleted_at",
+                message: "Category archive requires `archived` columns. Run Schema.sql idempotent upgrade.",
+                code: "SCHEMA_MISSING_archived",
             });
         }
         res.status(500).json({ error: error.message });
+    } finally {
+        if (connection) connection.release();
     }
 };

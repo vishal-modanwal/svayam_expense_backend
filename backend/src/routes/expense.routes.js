@@ -9,6 +9,7 @@ import {
     downloadMyExpenseReportPdf,
     downloadAdminExpenseReportPdf
 } from "../controllers/expense.controllers.js";
+import { getMyArchivedExpenses } from "../controllers/archived.controllers.js";
 import { scanReceiptForForm } from "../controllers/receiptScan.controller.js";
 import { auth } from "../middlewares/auth.middleware.js";
 import { adminOnly } from "../middlewares/admin.middleware.js";
@@ -26,6 +27,7 @@ router.route('/scan-receipt').post(auth, parseReceiptScanUpload, scanReceiptForF
 router.route('/').post(auth, optionalReceiptUpload, addExpense);
 
 // 1. Logged-in User ke apne expenses
+router.route('/my-expenses/archived').get(auth, getMyArchivedExpenses);
 router.route('/my-expenses').get(auth, getUserExpenses);
 
 // 2. Admin Only: Saare expenses dekhna
