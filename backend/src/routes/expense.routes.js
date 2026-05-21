@@ -7,7 +7,8 @@ import {
     updateExpense,
     deleteExpense,
     downloadMyExpenseReportPdf,
-    downloadAdminExpenseReportPdf
+    downloadAdminExpenseReportPdf,
+    downloadAdminUserExpenseReportPdf,
 } from "../controllers/expense.controllers.js";
 import { getMyArchivedExpenses } from "../controllers/archived.controllers.js";
 import { scanReceiptForForm } from "../controllers/receiptScan.controller.js";
@@ -42,6 +43,7 @@ router.route('/search').get(adminOnly, searchExpensesByUserName);
 // PDF reports
 router.route('/report/pdf').get(downloadMyExpenseReportPdf);
 router.route('/report/pdf/all').get(adminOnly, downloadAdminExpenseReportPdf);
+router.route('/report/pdf/user/:userId').get(adminOnly, downloadAdminUserExpenseReportPdf);
 
 // Update / delete (keep after static paths so :id does not capture e.g. "report")
 router.route('/:id').put(optionalReceiptUpload, updateExpense).delete(deleteExpense);

@@ -3,6 +3,8 @@ import { adminOnly } from "../middlewares/admin.middleware.js";
 import { auth } from "../middlewares/auth.middleware.js";
 import {
     createCategoryWithBudget,
+    createMonthlyBudgetForCategory,
+    getBudgetCategoryOptions,
     deleteBudget,
     getDashboardExpensesByView,
     getCategoryWiseBudgets,
@@ -69,6 +71,10 @@ router.route('/CategoryBudget/:id')
 router.route('/total-summary').get(auth , adminOnly,  getTotalBudgetsSummary);
 router.route('/dashboard-expenses').get(auth, adminOnly, getDashboardExpensesByView);
 router.route('/budget-details').get(auth, adminOnly, getCategoryWiseBudgets);
+/** Add-budget dropdown: all active categories (+ has_budget_for_period for selected month/year) */
+router.route('/budget/category-options').get(auth, adminOnly, getBudgetCategoryOptions);
+/** Add budget for existing category (body: category_id, month, year, allocated_amount) */
+router.route('/budget').post(auth, adminOnly, createMonthlyBudgetForCategory);
 /** monthly_budgets row id — from GET /budget-details as budget_id */
 router.route('/budget/:id')
     .put(auth, adminOnly, updateBudget)

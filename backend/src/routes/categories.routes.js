@@ -1,5 +1,6 @@
 import { Router } from "express";
 import {
+    createCategory,
     deleteCategory,
     getAllCategories,
     getArchivedCategoriesList,
@@ -15,11 +16,11 @@ const router = Router();
 router.use(auth, requireActiveUser);
 router.route("/archived").get(getArchivedCategoriesList);
 router.route("/archived/budgets").get(getArchivedBudgets);
-router.route("/").get(getAllCategories);
+router.route("/").get(getAllCategories).post(adminOnly, createCategory);
 router.route("/:id").get(getCategoryById);
 
 //admin
-router.route('/:id').post(adminOnly, updateCategory);
+router.route("/:id").post(adminOnly, updateCategory);
 router.route('/:id').delete(adminOnly, deleteCategory);
 
 

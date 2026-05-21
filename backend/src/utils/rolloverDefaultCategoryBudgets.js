@@ -55,12 +55,16 @@ async function ensureDefaultCategory(conn, name) {
 }
 
 /**
- * Create monthly_budgets for fixed default categories if missing for target month/year.
- * Amount: previous month's allocated_amount, else DEFAULT_CATEGORY_BUDGET_AMOUNT (5000).
- * Idempotent: never updates an existing row for that period.
+ * Monthly cron for the four default categories:
+ * 1) Ensure category rows exist (active)
+ * 2) If no monthly_budgets row for target month/year → copy previous month's amount/currency,
+ *    else DEFAULT_CATEGORY_BUDGET_AMOUNT (5000). Admin updates this month carry forward next month.
+ * Never updates an existing budget row — admin edits via PUT /api/admin/budget/:id
+ *
+ * Other categories: admin creates category + budget manually (POST /api/admin/budget, CategoryBudget, etc.)
  *
  * @param {import("mariadb").PoolConnection} conn
- * @param {{ month?: number, year?: number }} [options]
+ * @param {{ month?: number; year?: number }} [options]
  */
 export async function rolloverDefaultCategoryBudgets(conn, options = {}) {
     const now = new Date();
@@ -74,6 +78,7 @@ export async function rolloverDefaultCategoryBudgets(conn, options = {}) {
         year,
         default_amount: defaultAmount,
         previous_period: { month: prevMonth, year: prevYear },
+        policy: "copy_previous_month_else_default_if_missing",
         categories_ensured: [],
         created: [],
         skipped: [],
@@ -143,7 +148,7 @@ export async function rolloverDefaultCategoryBudgets(conn, options = {}) {
                 budget_id: num(ins.insertId),
                 allocated_amount,
                 currency,
-                source: fromPrevious ? "previous_month" : "default",
+                source: fromPrevious ? "previous_month" : "default_amount",
                 category_action: categoryAction,
             });
         } catch (err) {
@@ -156,11 +161,36 @@ export async function rolloverDefaultCategoryBudgets(conn, options = {}) {
             }
             result.errors.push({
                 category_name: name,
-                code: "insert_failed",
+                code: "rollover_failed",
                 message: String(err?.message ?? err),
             });
         }
     }
 
+    return result;
+}
+
+/** Categories-only pass (no budget insert) — for tests or partial ops if needed later. */
+export async function ensureDefaultCategories(conn, options = {}) {
+    const now = new Date();
+    const month = options.month ?? now.getMonth() + 1;
+    const year = options.year ?? now.getFullYear();
+    const result = { month, year, categories: [], errors: [] };
+
+    for (const name of DEFAULT_CATEGORY_NAMES) {
+        try {
+            const { categoryId, action } = await ensureDefaultCategory(conn, name);
+            result.categories.push({
+                category_name: name,
+                category_id: categoryId,
+                action,
+            });
+        } catch (err) {
+            result.errors.push({
+                category_name: name,
+                message: String(err?.message ?? err),
+            });
+        }
+    }
     return result;
 }

@@ -1,4 +1,4 @@
-/** Seed-aligned default category names — monthly budget rollover applies only to these. */
+/** Seed-aligned default category names — monthly cron ensures these + default budget if missing. */
 export const DEFAULT_CATEGORY_NAMES = [
     "Marketing",
     "IT Infrastructure",

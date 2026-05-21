@@ -22,6 +22,70 @@ const mapCategoryRow = (row) => {
 };
 
 /**
+ * POST /api/category — create category only (admin). Budget: POST /api/admin/budget.
+ * Body: { name, description? }
+ */
+export const createCategory = async (req, res) => {
+    const name = String(req.body?.name ?? "").trim();
+    const description =
+        req.body?.description !== undefined && req.body?.description !== null
+            ? String(req.body.description).trim() || null
+            : null;
+
+    if (!name) {
+        return res.status(400).json({ message: "name is required." });
+    }
+    if (name.length > 100) {
+        return res.status(400).json({ message: "name must be at most 100 characters." });
+    }
+
+    try {
+        const dup = selectRowArray(
+            await pool.query(
+                `SELECT id FROM categories WHERE name = ? AND archived = ? LIMIT 1`,
+                [name, ARCHIVED_NO]
+            )
+        );
+        if (dup.length > 0) {
+            return res.status(409).json({
+                message: "A category with this name already exists.",
+                category_id: num(dup[0].id),
+            });
+        }
+
+        const ins = await pool.query(
+            `INSERT INTO categories (name, description, archived) VALUES (?, ?, ?)`,
+            [name, description, ARCHIVED_NO]
+        );
+        const insertMeta = Array.isArray(ins) ? ins[0] : ins;
+        const categoryId = num(insertMeta?.insertId);
+
+        const rows = selectRowArray(
+            await pool.query(
+                `SELECT id, name, description, created_at, archived FROM categories WHERE id = ?`,
+                [categoryId]
+            )
+        );
+
+        res.status(201).json({
+            message: "Category created. Set a monthly budget via POST /api/admin/budget.",
+            data: mapCategoryRow(rows[0] ?? { id: categoryId, name, description, archived: ARCHIVED_NO }),
+        });
+    } catch (error) {
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({ message: "A category with this name already exists." });
+        }
+        if (isMissingArchivedColumnError(error)) {
+            return res.status(503).json({
+                message: "Run Schema.sql archived upgrade, then retry.",
+                code: "SCHEMA_MISSING_archived",
+            });
+        }
+        res.status(500).json({ error: error.message });
+    }
+};
+
+/**
  * GET ALL CATEGORIES — active only (archived: GET /api/category/archived).
  */
 export const getAllCategories = async (req, res) => {

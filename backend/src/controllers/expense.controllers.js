@@ -767,10 +767,13 @@ export const deleteExpense = async (req, res) => {
     }
 };
 
-const parseReportFilters = (req) => {
+const parseReportFilters = (req, { requirePeriod = false } = {}) => {
     const { month, year, category_id } = req.query;
     const m = month !== undefined && month !== '' ? parseInt(month, 10) : null;
     const y = year !== undefined && year !== '' ? parseInt(year, 10) : null;
+    if (requirePeriod && (m == null || y == null)) {
+        return { error: 'month and year are required for monthly reports.' };
+    }
     if ((m == null) !== (y == null)) {
         return { error: 'Provide both month and year, or omit both for all periods.' };
     }
@@ -785,7 +788,7 @@ const parseReportFilters = (req) => {
 
 const fetchExpensesForPdf = async (whereBody, params) => {
     const sql = `
-        SELECT e.expense_date, e.title, e.amount, e.payment_method, e.expense_type,
+        SELECT e.expense_date, e.title, e.vendor, e.amount, e.payment_method, e.expense_type,
                e.description AS expense_description,
                c.name AS category_name, u.name AS user_name
         FROM expenses e
@@ -832,6 +835,54 @@ export const downloadMyExpenseReportPdf = async (req, res) => {
         sendExpenseReportPdf(res, {
             reportTitle: 'Svayam — My expense report',
             subtitleLines: [label, period],
+            rows,
+            includeUserColumn: false
+        });
+    } catch (error) {
+        if (!res.headersSent) res.status(500).json({ error: error.message });
+    }
+};
+
+/**
+ * PDF report: one user's expenses for a month (admin).
+ * Path: userId. Query: month, year (required); optional category_id.
+ */
+export const downloadAdminUserExpenseReportPdf = async (req, res) => {
+    try {
+        const targetUserId = parseInt(req.params.userId, 10);
+        if (!Number.isFinite(targetUserId) || targetUserId < 1) {
+            return res.status(400).json({ message: 'Invalid user id.' });
+        }
+
+        const parsed = parseReportFilters(req, { requirePeriod: true });
+        if (parsed.error) return res.status(400).json({ message: parsed.error });
+
+        const userRows = selectRowArray(
+            await pool.query(
+                'SELECT id, name, email FROM users WHERE id = ? LIMIT 1',
+                [targetUserId]
+            )
+        );
+        if (!userRows.length) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+        const targetUser = userRows[0];
+
+        const whereParts = ['e.user_id = ?', 'MONTH(e.expense_date) = ?', 'YEAR(e.expense_date) = ?'];
+        const params = [targetUserId, parsed.month, parsed.year];
+        if (parsed.category_id != null) {
+            whereParts.push('e.category_id = ?');
+            params.push(parsed.category_id);
+        }
+
+        const rows = await fetchExpensesForPdf(whereParts.join(' AND '), params);
+        const period = `Period: ${parsed.year}-${String(parsed.month).padStart(2, '0')}`;
+        const label =
+            targetUser.name || targetUser.email || `User #${targetUserId}`;
+        const by = req.user.name || req.user.email || `Admin #${req.user.id}`;
+        sendExpenseReportPdf(res, {
+            reportTitle: 'Svayam — User monthly expense report',
+            subtitleLines: [label, period, `Exported by: ${by}`],
             rows,
             includeUserColumn: false
         });

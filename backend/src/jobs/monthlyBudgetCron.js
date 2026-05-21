@@ -119,7 +119,7 @@ export function startMonthlyBudgetCron() {
     scheduledTask = cron.schedule(
         schedule,
         async () => {
-            console.log("[cron] starting monthly budget job (user caps clear + category rollover)…");
+            console.log("[cron] starting monthly job (user caps clear + default category budgets)…");
             const outcome = await executeDefaultBudgetRollover();
             console.log("[cron] monthly budget job finished:", JSON.stringify(outcome));
         },
@@ -127,7 +127,7 @@ export function startMonthlyBudgetCron() {
     );
 
     console.log(
-        `[cron] default budget rollover scheduled (${schedule}, tz=${timezone})`
+        `[cron] default 4-category budgets scheduled (${schedule}, tz=${timezone}); copy prev month else ${process.env.DEFAULT_CATEGORY_BUDGET_AMOUNT ?? "5000"}`
     );
     return scheduledTask;
 }

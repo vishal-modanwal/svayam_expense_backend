@@ -16,6 +16,8 @@ import {
 import { notifyUserAccountActivated } from "../utils/userActivationNotify.js";
 import { resolvePeriodFromQuery } from "../utils/periodQuery.js";
 
+const num = (v) => (typeof v === "bigint" ? Number(v) : Number(v || 0));
+
 /** True when (year, month) is strictly before the current calendar month (same rule as budget create). */
 const isPastBudgetPeriod = (year, month) => {
     const d = new Date();
@@ -258,11 +260,176 @@ export const createCategoryWithBudget = async (req, res) => {
 };
 
 /**
+ * GET /api/admin/budget/category-options?month=&year=
+ * All active categories for Add-budget dropdown (no manual name typing).
+ * has_budget_for_period: true if an active monthly_budgets row exists for that month/year.
+ */
+export const getBudgetCategoryOptions = async (req, res) => {
+    try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+        const { month, year } = period;
+
+        const rows = selectRowArray(
+            await pool.query(
+                `SELECT c.id, c.name, c.description, c.created_at,
+                    EXISTS (
+                        SELECT 1 FROM monthly_budgets b
+                        WHERE b.category_id = c.id
+                          AND b.month = ?
+                          AND b.year = ?
+                          AND b.archived = ?
+                    ) AS has_budget_for_period
+                 FROM categories c
+                 WHERE ${activeCategoryWhere("c")}
+                 ORDER BY c.name ASC`,
+                [month, year, ARCHIVED_NO]
+            )
+        );
+
+        res.json({
+            status: "success",
+            period: { month, year },
+            data: rows.map((row) => ({
+                id: num(row.id),
+                name: row.name,
+                description: row.description ?? null,
+                created_at: row.created_at,
+                has_budget_for_period: Boolean(Number(row.has_budget_for_period)),
+            })),
+        });
+    } catch (error) {
+        if (isMissingArchivedColumnError(error)) {
+            return res.status(503).json({
+                message: "Run Schema.sql archived upgrade, then retry.",
+                code: "SCHEMA_MISSING_archived",
+            });
+        }
+        res.status(500).json({ error: error.message });
+    }
+};
+
+/**
+ * POST /api/admin/budget
+ * Set monthly budget for an existing category (dropdown selection).
+ * Body: { category_id, month, year, allocated_amount, currency? }
+ */
+export const createMonthlyBudgetForCategory = async (req, res) => {
+    const categoryId = parseInt(req.body?.category_id, 10);
+    const month = parseInt(req.body?.month, 10);
+    const year = parseInt(req.body?.year, 10);
+    const { allocated_amount, currency } = req.body;
+    const adminId =
+        typeof req.user?.id === "bigint" ? Number(req.user.id) : req.user?.id;
+
+    if (!Number.isFinite(categoryId) || categoryId < 1) {
+        return res.status(400).json({ message: "category_id is required." });
+    }
+    if (!Number.isFinite(month) || month < 1 || month > 12) {
+        return res.status(400).json({ message: "Valid month (1–12) is required." });
+    }
+    if (!Number.isFinite(year) || year < 2000 || year > 2100) {
+        return res.status(400).json({ message: "Valid year is required." });
+    }
+    if (allocated_amount === undefined || allocated_amount === null || allocated_amount === "") {
+        return res.status(400).json({ message: "allocated_amount is required." });
+    }
+    const alloc = Number(allocated_amount);
+    if (!Number.isFinite(alloc) || alloc < 0) {
+        return res.status(400).json({ message: "allocated_amount must be a non-negative number." });
+    }
+    if (isPastBudgetPeriod(year, month)) {
+        return res.status(400).json({ message: "Past months are not allowed for budgeting." });
+    }
+
+    let connection;
+    try {
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+
+        const catRows = selectRowArray(
+            await connection.query(
+                `SELECT id, name FROM categories WHERE id = ? AND ${activeCategoryWhere("categories")}`,
+                [categoryId]
+            )
+        );
+        if (!catRows.length) {
+            await connection.rollback();
+            return res.status(404).json({ message: "Category not found or is archived." });
+        }
+
+        const existingBudget = selectRowArray(
+            await connection.query(
+                `SELECT id FROM monthly_budgets
+                 WHERE category_id = ? AND month = ? AND year = ? AND archived = ?
+                 LIMIT 1`,
+                [categoryId, month, year, ARCHIVED_NO]
+            )
+        );
+        if (existingBudget.length > 0) {
+            await connection.rollback();
+            return res.status(409).json({
+                message: "A budget for this category already exists for the selected month and year.",
+                budget_id: num(existingBudget[0].id),
+            });
+        }
+
+        const ins = await connection.query(
+            `INSERT INTO monthly_budgets
+                (category_id, month, year, allocated_amount, currency, created_by, archived)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+                categoryId,
+                month,
+                year,
+                alloc,
+                currency ? String(currency).trim().slice(0, 10) : "INR",
+                adminId,
+                ARCHIVED_NO,
+            ]
+        );
+        const insertMeta = Array.isArray(ins) ? ins[0] : ins;
+        const budgetId = num(insertMeta?.insertId);
+
+        await connection.commit();
+
+        res.status(201).json({
+            message: "Budget created for category.",
+            data: {
+                budget_id: budgetId,
+                category_id: categoryId,
+                category_name: catRows[0].name,
+                month,
+                year,
+                allocated_amount: alloc,
+                currency: currency ? String(currency).trim().slice(0, 10) : "INR",
+            },
+        });
+    } catch (error) {
+        if (connection) await connection.rollback();
+        if (error.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({
+                message: "A budget for this category already exists for the selected month and year.",
+            });
+        }
+        if (isMissingArchivedColumnError(error)) {
+            return res.status(503).json({
+                message: "Run Schema.sql archived upgrade, then retry.",
+                code: "SCHEMA_MISSING_archived",
+            });
+        }
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (connection) connection.release();
+    }
+};
+
+/**
  * GET TOTAL BUDGET SUMMARY (dashboard cards)
  * Query: month, year (optional — default current calendar period).
  */
-const num = (v) => (typeof v === 'bigint' ? Number(v) : Number(v || 0));
-
 export const getTotalBudgetsSummary = async (req, res) => {
     try {
         const period = resolvePeriodFromQuery(req.query);
