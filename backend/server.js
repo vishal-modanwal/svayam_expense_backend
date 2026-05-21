@@ -1,5 +1,6 @@
 import app from "./src/app.js";
-import { testConnection , pool } from "./src/db/index.js";
+import { testConnection } from "./src/db/index.js";
+import { startMonthlyBudgetCron } from "./src/jobs/monthlyBudgetCron.js";
 import dotenv from "dotenv";
 import http from "http";
 import { Server } from "socket.io";
@@ -34,11 +35,12 @@ io.on("connection", (socket) => {
 
 
 testConnection()
-.then((conn)=>{
-  server.listen(process.env.PORT , ()=>{
-    console.log(`app is up and running on port ${process.env.PORT}`);
-})
-})
+  .then(() => {
+    startMonthlyBudgetCron();
+    server.listen(process.env.PORT, () => {
+      console.log(`app is up and running on port ${process.env.PORT}`);
+    });
+  })
 .catch((err)=>console.log(err));
 
 

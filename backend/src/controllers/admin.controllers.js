@@ -9,6 +9,12 @@ import {
     ARCHIVED_YES,
 } from "../utils/categoryArchive.js";
 import { archiveCategoryCascade } from "../utils/archiveCategory.js";
+import {
+    cancelPendingActivationRequests,
+    resolvePendingActivationRequestsAsApproved,
+} from "../utils/activationRequest.js";
+import { notifyUserAccountActivated } from "../utils/userActivationNotify.js";
+import { resolvePeriodFromQuery } from "../utils/periodQuery.js";
 
 /** True when (year, month) is strictly before the current calendar month (same rule as budget create). */
 const isPastBudgetPeriod = (year, month) => {
@@ -19,35 +25,170 @@ const isPastBudgetPeriod = (year, month) => {
 };
 
 /**
+ * PATCH /api/admin/users/:id/activate — activate inactive user (e.g. new registration).
+ * Body: { admin_note? }
+ */
+export const activateUserAccount = async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+        return res.status(400).json({ message: "Invalid user id." });
+    }
+
+    const adminNote =
+        req.body?.admin_note !== undefined && req.body?.admin_note !== null
+            ? String(req.body.admin_note).trim() || null
+            : null;
+
+    const adminId =
+        typeof req.user?.id === "bigint" ? Number(req.user.id) : req.user?.id;
+
+    let connection;
+    try {
+        const rows = selectRowArray(
+            await pool.query(
+                "SELECT id, name, email, role, is_active FROM users WHERE id = ?",
+                [id]
+            )
+        );
+        if (!rows.length) {
+            return res.status(404).json({ message: "User not found." });
+        }
+
+        const user = rows[0];
+        if (user.role === "admin") {
+            return res.status(400).json({ message: "Cannot activate admin accounts via this endpoint." });
+        }
+        if (Number(user.is_active) === 1) {
+            return res.status(400).json({
+                message: "User is already active.",
+                activity_status: "active",
+            });
+        }
+
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        await connection.query("UPDATE users SET is_active = 1 WHERE id = ?", [id]);
+        await resolvePendingActivationRequestsAsApproved(
+            connection,
+            id,
+            adminId,
+            adminNote
+        );
+        await connection.commit();
+
+        const activated = {
+            id: typeof user.id === "bigint" ? Number(user.id) : user.id,
+            name: user.name,
+            email: user.email,
+        };
+
+        await notifyUserAccountActivated(activated, adminNote);
+
+        res.json({
+            message: "User account activated successfully.",
+            user: {
+                ...activated,
+                is_active: true,
+                activity_status: "active",
+            },
+        });
+    } catch (error) {
+        if (connection) await connection.rollback();
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (connection) connection.release();
+    }
+};
+
+/**
  * TOGGLE USER ACTIVE STATUS (Admin Only)
  * Purpose: Enable or disable a user account.
  */
 export const toggleUserStatus = async (req, res) => {
-    const { id } = req.params; // Jis user ka status badalna hai
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+        return res.status(400).json({ message: "Invalid user id." });
+    }
 
+    let connection;
     try {
-        // SQL logic: is_active = NOT is_active status ko flip kar deta hai
-        const result = await pool.query(
-            "UPDATE users SET is_active = NOT is_active WHERE id = ?",
-            [id]
-        );
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
 
-        if (result.affectedRows === 0) {
+        const beforeUser = selectRowArray(
+            await connection.query(
+                "SELECT id, name, email, role, is_active FROM users WHERE id = ?",
+                [id]
+            )
+        );
+        if (!beforeUser.length) {
+            await connection.rollback();
             return res.status(404).json({ message: "User not found" });
         }
 
-        // Updated status fetch karein confirmation ke liye
-        const updatedUser = await pool.query(
-            "SELECT id, name, is_active FROM users WHERE id = ?",
+        const wasActive = Number(beforeUser[0].is_active) === 1;
+
+        const result = await connection.query(
+            "UPDATE users SET is_active = NOT is_active WHERE id = ?",
             [id]
         );
+        const affected = typeof result?.affectedRows === "number" ? result.affectedRows : 0;
+        if (affected === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: "User not found" });
+        }
 
-        res.json({ 
-            message: `User status updated successfully.`,
-            user: updatedUser[0]
+        const updatedUser = selectRowArray(
+            await connection.query(
+                "SELECT id, name, email, role, is_active FROM users WHERE id = ?",
+                [id]
+            )
+        );
+        const u = updatedUser[0];
+        const nowActive = Number(u.is_active) === 1;
+
+        if (!nowActive) {
+            await cancelPendingActivationRequests(connection, id);
+        } else if (!wasActive && nowActive) {
+            const adminId =
+                typeof req.user?.id === "bigint"
+                    ? Number(req.user.id)
+                    : req.user?.id;
+            await resolvePendingActivationRequestsAsApproved(
+                connection,
+                id,
+                adminId,
+                null
+            );
+        }
+
+        await connection.commit();
+
+        if (
+            !wasActive &&
+            nowActive &&
+            u.role !== "admin" &&
+            String(u.email ?? "").trim()
+        ) {
+            notifyUserAccountActivated(u).catch((err) =>
+                console.error("Activate notify failed:", err.message)
+            );
+        }
+
+        res.json({
+            message: "User status updated successfully.",
+            user: {
+                id: typeof u.id === "bigint" ? Number(u.id) : u.id,
+                name: u.name,
+                is_active: nowActive,
+                activity_status: nowActive ? "active" : "inactive",
+            },
         });
     } catch (error) {
+        if (connection) await connection.rollback();
         res.status(500).json({ error: error.message });
+    } finally {
+        if (connection) connection.release();
     }
 };
 
@@ -117,13 +258,19 @@ export const createCategoryWithBudget = async (req, res) => {
 };
 
 /**
- * GET TOTAL BUDGET SUMMARY (dashboard cards — current calendar month/year)
- * Budget: allocated sum. Expenses / remaining: standard-type only. Extra: extra-type sum/count.
+ * GET TOTAL BUDGET SUMMARY (dashboard cards)
+ * Query: month, year (optional — default current calendar period).
  */
 const num = (v) => (typeof v === 'bigint' ? Number(v) : Number(v || 0));
 
 export const getTotalBudgetsSummary = async (req, res) => {
     try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+        const { month, year } = period;
+
         const activeCat = activeCategoryWhere("c");
         const activeBud = activeBudgetWhere("b");
         const activeExp = activeExpenseCategoryExists("e");
@@ -131,31 +278,27 @@ export const getTotalBudgetsSummary = async (req, res) => {
             SELECT
                 (SELECT COALESCE(SUM(b.allocated_amount), 0) FROM monthly_budgets b
                  INNER JOIN categories c ON c.id = b.category_id AND ${activeCat}
-                 WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE()) AND ${activeBud}) AS total_allocated,
+                 WHERE b.month = ? AND b.year = ? AND ${activeBud}) AS total_allocated,
                 (SELECT COUNT(*) FROM monthly_budgets b
                  INNER JOIN categories c ON c.id = b.category_id AND ${activeCat}
-                 WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE()) AND ${activeBud}) AS budget_category_count,
+                 WHERE b.month = ? AND b.year = ? AND ${activeBud}) AS budget_category_count,
 
                 (SELECT COALESCE(SUM(e.amount), 0) FROM expenses e
                  WHERE e.expense_type = 'standard'
-                 AND MONTH(e.expense_date) = MONTH(CURRENT_DATE())
-                 AND YEAR(e.expense_date) = YEAR(CURRENT_DATE())
+                 AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
                  AND ${activeExp}) AS total_spent,
                 (SELECT COUNT(*) FROM expenses e
                  WHERE e.expense_type = 'standard'
-                 AND MONTH(e.expense_date) = MONTH(CURRENT_DATE())
-                 AND YEAR(e.expense_date) = YEAR(CURRENT_DATE())
+                 AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
                  AND ${activeExp}) AS expense_record_count,
 
                 (SELECT COALESCE(SUM(e.amount), 0) FROM expenses e
                  WHERE e.expense_type = 'extra'
-                 AND MONTH(e.expense_date) = MONTH(CURRENT_DATE())
-                 AND YEAR(e.expense_date) = YEAR(CURRENT_DATE())
+                 AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
                  AND ${activeExp}) AS extra_total_spent,
                 (SELECT COUNT(*) FROM expenses e
                  WHERE e.expense_type = 'extra'
-                 AND MONTH(e.expense_date) = MONTH(CURRENT_DATE())
-                 AND YEAR(e.expense_date) = YEAR(CURRENT_DATE())
+                 AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
                  AND ${activeExp}) AS extra_transaction_count,
 
                 (SELECT COUNT(*) FROM (
@@ -167,13 +310,29 @@ export const getTotalBudgetsSummary = async (req, res) => {
                         AND e.archived = 'no'
                         AND MONTH(e.expense_date) = b.month
                         AND YEAR(e.expense_date) = b.year
-                    WHERE b.month = MONTH(CURRENT_DATE()) AND b.year = YEAR(CURRENT_DATE()) AND ${activeBud}
+                    WHERE b.month = ? AND b.year = ? AND ${activeBud}
                     GROUP BY b.id, b.allocated_amount
                     HAVING rem > 0
                 ) t) AS categories_with_remaining_count
         `;
 
-        const result = await pool.query(sql);
+        const periodParams = [
+            month,
+            year,
+            month,
+            year,
+            month,
+            year,
+            month,
+            year,
+            month,
+            year,
+            month,
+            year,
+            month,
+            year,
+        ];
+        const result = await pool.query(sql, periodParams);
         const data = result[0] || {};
 
         const allocated = num(data.total_allocated);
@@ -187,23 +346,20 @@ export const getTotalBudgetsSummary = async (req, res) => {
         const categoriesWithRemaining = num(data.categories_with_remaining_count);
         const stdTx = expenseRecordCount;
 
-        const month = new Date().getMonth() + 1;
-        const year = new Date().getFullYear();
-
         const cards = {
             budget: {
                 id: "budget",
                 label: "Budget",
                 amount: allocated,
                 transaction_count: budgetCategoryCount,
-                transaction_label: "Budget categories (this month)"
+                transaction_label: "Budget categories (selected period)"
             },
             expenses: {
                 id: "expenses",
                 label: "Expenses",
                 amount: spent,
                 transaction_count: expenseRecordCount,
-                transaction_label: "Standard expense records (this month)"
+                transaction_label: "Standard expense records (selected period)"
             },
             remaining: {
                 id: "remaining",
@@ -217,7 +373,7 @@ export const getTotalBudgetsSummary = async (req, res) => {
                 label: "Extra expenses",
                 amount: extraSpent,
                 transaction_count: extraTx,
-                transaction_label: "Extra-type transactions"
+                transaction_label: "Extra-type transactions (selected period)"
             }
         };
 
@@ -237,6 +393,7 @@ export const getTotalBudgetsSummary = async (req, res) => {
 
         res.json({
             status: "success",
+            period: { month, year },
             month,
             year,
             cards,
@@ -252,9 +409,15 @@ export const getTotalBudgetsSummary = async (req, res) => {
  * Returns user profile fields + expense aggregates.
  * Query: page (default 1), limit (default 10, max 100); search — matches name, email, or mobile (substring);
  * is_active (1/0 or true/false); sortBy: created_at|name|email|mobile_no|total_expenses|expense_record_count|is_active; order asc|desc.
+ * month, year (optional — default current period; expense aggregates use expense_date).
  */
 export const getUsersDetails = async (req, res) => {
     try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+
         const { search = "", is_active, sortBy = "created_at", order = "desc" } = req.query;
         const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100);
@@ -305,13 +468,20 @@ export const getUsersDetails = async (req, res) => {
                 COUNT(e.id) AS expense_record_count
             FROM users u
             LEFT JOIN expenses e ON e.user_id = u.id AND ${activeExpenseWhere("e")}
+                AND MONTH(e.expense_date) = ? AND YEAR(e.expense_date) = ?
             ${whereSql}
             GROUP BY u.id, u.name, u.email, u.mobile_no, u.is_active, u.created_at
             ORDER BY ${orderBy} ${orderDir}, u.id DESC
             LIMIT ? OFFSET ?
         `;
 
-        const rows = await pool.query(sql, [...params, limit, offset]);
+        const rows = await pool.query(sql, [
+            ...params,
+            period.month,
+            period.year,
+            limit,
+            offset,
+        ]);
         const list = Array.isArray(rows) ? rows : [];
         const data = list.map((row) => ({
             id: num(row.id),
@@ -342,6 +512,7 @@ export const getUsersDetails = async (req, res) => {
 
         res.json({
             status: "success",
+            period: { month: period.month, year: period.year },
             total_users: totalUsers,
             search: searchTrim || undefined,
             column_count: columns.length,
@@ -485,6 +656,7 @@ export const getCategoryWiseBudgets = async (req, res) => {
         res.json({
             status: "success",
             scope: "active",
+            period: { month, year },
             month,
             year,
             month_name: monthName,
@@ -514,9 +686,15 @@ export const getCategoryWiseBudgets = async (req, res) => {
  * - page (default 1), limit (default 10, max 100)
  * - sortBy=expense_date|amount|created_at (default expense_date)
  * - order=asc|desc (default desc)
+ * - month, year (optional — default current period; filters by expense_date)
  */
 export const getDashboardExpensesByView = async (req, res) => {
     try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+
         const { view } = req.query;
         const allowedViews = new Set(["users", "users-inactive", "admins", "admins-extra"]);
         if (!allowedViews.has(String(view || "").trim())) {
@@ -556,6 +734,9 @@ export const getDashboardExpensesByView = async (req, res) => {
             where.push("e.expense_type = ?");
             params.push("admin", "extra");
         }
+
+        where.push("MONTH(e.expense_date) = ?", "YEAR(e.expense_date) = ?");
+        params.push(period.month, period.year);
 
         const baseWhere = where.join(" AND ");
         const buildDashSql = () => {
@@ -603,6 +784,7 @@ export const getDashboardExpensesByView = async (req, res) => {
         res.json({
             status: "success",
             scope: "active",
+            period: { month: period.month, year: period.year },
             view,
             pagination: {
                 page,

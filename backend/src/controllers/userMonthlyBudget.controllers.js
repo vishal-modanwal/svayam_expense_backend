@@ -3,6 +3,7 @@ import { selectRowArray } from "../utils/mariaRows.js";
 import {
     fetchUserMonthlyBudgetRow,
     sumUserStandardSpent,
+    fetchUserBudgetsPeriodSummary,
     buildUserBudgetPayload,
     syncUserBudgetAfterExpenseChange,
     isMissingUserBudgetTableError,
@@ -207,6 +208,143 @@ export const listUserMonthlyBudgets = async (req, res) => {
                 data: [],
                 pagination: { page: 1, limit: 50, totalItems: 0, totalPages: 0 },
             });
+        }
+        res.status(500).json({ error: e.message });
+    }
+};
+
+const emptyUserBudgetsSummaryPayload = (month, year) => ({
+    status: "success",
+    month,
+    year,
+    scope: "user_monthly_budgets",
+    spend_scope: "budgeted_users_only",
+    cards: {
+        budget: {
+            id: "user_budget_total",
+            label: "Users budget (total caps)",
+            amount: 0,
+            transaction_count: 0,
+            transaction_label: "Users with a monthly cap set",
+        },
+        expenses: {
+            id: "user_expenses_total",
+            label: "Spent (budgeted users)",
+            amount: 0,
+            transaction_count: 0,
+            transaction_label: "Standard expenses for users with a cap (this month)",
+        },
+        remaining: {
+            id: "user_effective_remaining",
+            label: "Effective remaining",
+            amount: 0,
+            transaction_count: 0,
+            transaction_label: "Headroom left under caps (users still within budget)",
+        },
+        over_budget: {
+            id: "user_over_budget_total",
+            label: "Over budget",
+            amount: 0,
+            transaction_count: 0,
+            transaction_label: "Users currently over their cap",
+        },
+    },
+    summary: {
+        total_allocated: 0,
+        total_spent: 0,
+        effective_remaining_total: 0,
+        over_budget_total: 0,
+        raw_remaining_total: 0,
+        remaining_total: 0,
+        overall_usage_percent: "0.00",
+        users_with_budget_count: 0,
+        users_over_budget_count: 0,
+        users_exceeded_flag_count: 0,
+        expense_record_count: 0,
+    },
+});
+
+/**
+ * GET /api/admin/user-budgets/summary?month=&year=
+ * Caps + spend only for users with user_monthly_budgets; effective remaining (headroom).
+ */
+export const getUserMonthlyBudgetsSummary = async (req, res) => {
+    try {
+        const now = new Date();
+        const month = parseInt(String(req.query.month ?? now.getMonth() + 1), 10);
+        const year = parseInt(String(req.query.year ?? now.getFullYear()), 10);
+
+        if (!Number.isFinite(month) || month < 1 || month > 12) {
+            return res.status(400).json({ message: "Valid month (1–12) is required." });
+        }
+        if (!Number.isFinite(year) || year < 2000 || year > 2100) {
+            return res.status(400).json({ message: "Valid year is required." });
+        }
+
+        const agg = await fetchUserBudgetsPeriodSummary(pool, month, year);
+
+        const cards = {
+            budget: {
+                id: "user_budget_total",
+                label: "Users budget (total caps)",
+                amount: agg.total_allocated,
+                transaction_count: agg.users_with_budget_count,
+                transaction_label: "Users with a monthly cap set",
+            },
+            expenses: {
+                id: "user_expenses_total",
+                label: "Spent (budgeted users)",
+                amount: agg.total_spent,
+                transaction_count: agg.expense_record_count,
+                transaction_label: "Standard expenses for users with a cap (this month)",
+            },
+            remaining: {
+                id: "user_effective_remaining",
+                label: "Effective remaining",
+                amount: agg.effective_remaining_total,
+                transaction_count:
+                    agg.users_with_budget_count - agg.users_over_budget_count,
+                transaction_label: "Headroom left under caps (users still within budget)",
+            },
+            over_budget: {
+                id: "user_over_budget_total",
+                label: "Over budget",
+                amount: agg.over_budget_total,
+                transaction_count: agg.users_over_budget_count,
+                transaction_label: "Users currently over their cap",
+            },
+        };
+
+        res.json({
+            status: "success",
+            month,
+            year,
+            scope: "user_monthly_budgets",
+            spend_scope: "budgeted_users_only",
+            cards,
+            summary: {
+                total_allocated: agg.total_allocated,
+                total_spent: agg.total_spent,
+                effective_remaining_total: agg.effective_remaining_total,
+                over_budget_total: agg.over_budget_total,
+                raw_remaining_total: agg.raw_remaining_total,
+                remaining_total: agg.effective_remaining_total,
+                overall_usage_percent: agg.overall_usage_percent,
+                users_with_budget_count: agg.users_with_budget_count,
+                users_over_budget_count: agg.users_over_budget_count,
+                users_exceeded_flag_count: agg.users_exceeded_flag_count,
+                expense_record_count: agg.expense_record_count,
+            },
+        });
+    } catch (e) {
+        if (isMissingUserBudgetTableError(e)) {
+            const now = new Date();
+            return res.json(
+                emptyUserBudgetsSummaryPayload(
+                    parseInt(String(req.query.month ?? now.getMonth() + 1), 10),
+                    parseInt(String(req.query.year ?? now.getFullYear()), 10)
+                )
+            );
         }
         res.status(500).json({ error: e.message });
     }

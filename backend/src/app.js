@@ -9,6 +9,7 @@ import categoryRouter from "./routes/categories.routes.js";
 import expenseRouter from "./routes/expense.routes.js";
 import tableMetaRouter from "./routes/tableMeta.routes.js";
 import chatRouter from "./routes/chat.routes.js";
+import internalCronRouter from "./routes/internalCron.routes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,6 +36,7 @@ app.use('/api/category' , categoryRouter);
 app.use('/api/expense' , expenseRouter);
 app.use('/api/meta', tableMetaRouter);
 app.use('/api/chat', chatRouter);
+app.use('/api/internal/cron', internalCronRouter);
 
 // Health Check
 app.get('/', (req, res) => {

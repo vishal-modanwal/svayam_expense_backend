@@ -8,6 +8,7 @@ import {
     getCategoryWiseBudgets,
     getTotalBudgetsSummary,
     getUsersDetails,
+    activateUserAccount,
     toggleUserStatus,
     updateBudget
 } from "../controllers/admin.controllers.js";
@@ -25,15 +26,28 @@ import {
 import {
     deleteUserMonthlyBudget,
     getUserMonthlyBudgetById,
+    getUserMonthlyBudgetsSummary,
     listUserMonthlyBudgets,
     updateUserMonthlyBudgetById,
     upsertUserMonthlyBudget,
 } from "../controllers/userMonthlyBudget.controllers.js";
+import {
+    getActivationRequestById,
+    getPendingActivationCount,
+    listActivationRequests,
+    reviewActivationRequest,
+} from "../controllers/activationRequest.controllers.js";
 
 const router = Router();
+router.route("/activation-requests/pending-count").get(auth, adminOnly, getPendingActivationCount);
+router.route("/activation-requests/:id")
+    .get(auth, adminOnly, getActivationRequestById)
+    .patch(auth, adminOnly, reviewActivationRequest);
+router.route("/activation-requests").get(auth, adminOnly, listActivationRequests);
 router.route("/archived/categories").get(auth, adminOnly, getArchivedCategories);
 router.route("/archived/expenses/:id/restore").patch(auth, adminOnly, restoreArchivedExpense);
 router.route("/archived/expenses").get(auth, adminOnly, getArchivedExpenses);
+router.route("/user-budgets/summary").get(auth, adminOnly, getUserMonthlyBudgetsSummary);
 router.route("/user-budgets/:id")
     .get(auth, adminOnly, getUserMonthlyBudgetById)
     .put(auth, adminOnly, updateUserMonthlyBudgetById)
@@ -43,6 +57,7 @@ router.route("/archived/budgets").get(auth, adminOnly, getArchivedBudgets);
 router.route('/notifications/unread-count').get(auth, adminOnly, getUnreadNotificationCount);
 router.route('/notifications/read-all').patch(auth, adminOnly, markAllNotificationsRead);
 router.route('/notifications').get(auth, adminOnly, getNotifications);
+router.route('/users/:id/activate').patch(auth, adminOnly, activateUserAccount);
 router.route('/toggle/:id').patch(auth , adminOnly, toggleUserStatus);
 router.route('/users-details').get(auth, adminOnly, getUsersDetails);
 router.route('/CategoryBudget').post(auth , adminOnly , createCategoryWithBudget);

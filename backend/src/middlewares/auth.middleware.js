@@ -20,15 +20,22 @@ export const auth = async (req, res, next) => {
 
             // 3. Fetch user from DB to ensure they still exist and are active
             const rows = selectRowArray(
-                await pool.query("SELECT id, name, email, role FROM users WHERE id = ?", [decoded.id])
+                await pool.query(
+                    "SELECT id, name, email, role, is_active FROM users WHERE id = ?",
+                    [decoded.id]
+                )
             );
 
             if (rows.length === 0) {
                 return res.status(401).json({ message: "Not authorized, user not found" });
             }
 
-            // 4. Attach user to request object
-            req.user = rows[0];
+            const row = rows[0];
+            req.user = {
+                ...row,
+                id: typeof row.id === "bigint" ? Number(row.id) : row.id,
+                is_active: Number(row.is_active) === 1 ? 1 : 0,
+            };
             return next();
         } catch (error) {
             console.error("Auth Middleware Error:", error.message);

@@ -340,3 +340,250 @@ export const sendWelcomeOnboardingEmail = async (to, name) => {
 
     return sendMail({ to, subject, html, text, attachments });
 };
+
+/**
+ * Email to user when admin approves or rejects an account activation request.
+ * @param {string} to
+ * @param {{ name?: string, action: 'approve' | 'reject', adminNote?: string | null }} detail
+ */
+export const sendActivationRequestReviewEmail = async (to, detail) => {
+    const email = String(to || "").trim();
+    if (!email) return false;
+
+    const approved = detail.action === "approve";
+    const safeName = String(detail.name || "there").trim() || "there";
+    const note = detail.adminNote ? String(detail.adminNote).trim() : "";
+
+    const subject = approved
+        ? "Your SvayamExpense account is now active"
+        : "Your SvayamExpense activation request was not approved";
+
+    const headline = approved ? "Account activated" : "Activation request declined";
+    const sublineHtml = approved
+        ? `Hi <strong style="color:#334155;">${escapeHtml(safeName)}</strong>, your request to reactivate your <strong>SvayamExpense</strong> account has been <strong style="color:#334155;">approved</strong>. You can sign in and use the app normally.`
+        : `Hi <strong style="color:#334155;">${escapeHtml(safeName)}</strong>, your request to reactivate your <strong>SvayamExpense</strong> account was <strong style="color:#334155;">not approved</strong> at this time. You may submit a new request from your profile if your situation has changed.`;
+
+    const cardTitle = approved ? "You are all set" : "What you can do next";
+    const cardSubtitle = approved ? "Account status" : "Request outcome";
+    const cardIntroHtml = approved
+        ? `Open SvayamExpense and sign in with your existing email and password. If you have trouble accessing the app, contact your organization administrator.`
+        : note
+          ? `Administrator note: <strong style="color:#334155;">${escapeHtml(note)}</strong>`
+          : `If you believe this was a mistake, contact your organization administrator or submit a new activation request after signing in.`;
+
+    const rows = approved
+        ? [
+              { label: "Status", valueHtml: escapeHtml("Active") },
+              { label: "Access", valueHtml: escapeHtml("Full app access restored") },
+          ]
+        : [
+              { label: "Status", valueHtml: escapeHtml("Inactive") },
+              { label: "New request", valueHtml: escapeHtml("Allowed after sign-in") },
+          ];
+
+    if (note && approved) {
+        rows.push({
+            label: "Admin note",
+            valueHtml: escapeHtml(note),
+        });
+    }
+
+    const footerHtml = `This is an automated message from SvayamExpense. Please do not reply to this email.`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml,
+    });
+
+    const text = approved
+        ? [
+              `Hi ${safeName},`,
+              "",
+              "Your SvayamExpense account activation request was approved.",
+              "Your account is now active. Sign in with your email and password.",
+              note ? `Admin note: ${note}` : "",
+              "",
+              "— SvayamExpense",
+          ]
+              .filter(Boolean)
+              .join("\n")
+        : [
+              `Hi ${safeName},`,
+              "",
+              "Your SvayamExpense account activation request was not approved.",
+              note ? `Reason: ${note}` : "",
+              "You may submit a new request from your profile after signing in.",
+              "",
+              "— SvayamExpense",
+          ]
+              .filter(Boolean)
+              .join("\n");
+
+    return sendMail({ to: email, subject, html, text, attachments });
+};
+
+/**
+ * After register — account created but inactive until admin activates.
+ */
+export const sendRegistrationPendingUserEmail = async (to, name) => {
+    const email = String(to || "").trim();
+    if (!email) return false;
+
+    const safeName = String(name || "there").trim() || "there";
+    const subject = "Account created — pending admin activation | SvayamExpense";
+
+    const headline = "Account created successfully";
+    const sublineHtml = `Hi <strong style="color:#334155;">${escapeHtml(safeName)}</strong>, your <strong>SvayamExpense</strong> account has been created. An administrator will review your profile and <strong style="color:#334155;">activate</strong> your account. After activation, you can sign in and <strong>add expenses</strong>.`;
+
+    const cardTitle = "What happens next";
+    const cardSubtitle = "Account status";
+    const cardIntroHtml = `You may sign in with your email and password, but expense features stay unavailable until an admin activates your account. We will email you again when your account is active.`;
+
+    const rows = [
+        { label: "Status", valueHtml: escapeHtml("Inactive (pending review)") },
+        { label: "Expenses", valueHtml: escapeHtml("Available after activation") },
+    ];
+
+    const footerHtml = `This is an automated message from SvayamExpense. Please do not reply to this email.`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml,
+    });
+
+    const text = [
+        `Hi ${safeName},`,
+        "",
+        "Your SvayamExpense account was created successfully.",
+        "An administrator will review your profile and activate your account.",
+        "After activation, you can sign in and add expenses.",
+        "You will receive another email when your account is activated.",
+        "",
+        "— SvayamExpense",
+    ].join("\n");
+
+    return sendMail({ to: email, subject, html, text, attachments });
+};
+
+/**
+ * Notify all admins by email when a new user completes registration.
+ */
+export const sendNewUserRegisteredAdminEmail = async (adminEmails, detail) => {
+    const list = (Array.isArray(adminEmails) ? adminEmails : [])
+        .map((e) => String(e).trim())
+        .filter(Boolean);
+    if (!list.length) return false;
+
+    const safeName = escapeHtml(String(detail.name || "New user").trim() || "New user");
+    const safeEmail = escapeHtml(String(detail.email || "").trim());
+    const safeMobile = escapeHtml(String(detail.mobile || "—").trim() || "—");
+    const userId = detail.userId != null ? escapeHtml(String(detail.userId)) : "—";
+
+    const subject = `SvayamExpense — New user registration: ${String(detail.name || detail.email || "review required")}`;
+
+    const headline = "New user registration";
+    const sublineHtml = `A new user completed signup and is <strong style="color:#334155;">waiting for activation</strong>. Please review their profile in the admin dashboard and activate the account when appropriate.`;
+
+    const cardTitle = safeName;
+    const cardSubtitle = "Registration details";
+    const cardIntroHtml = `Until you activate this account, the user cannot add expenses. Use the admin panel to review pending users and approve access.`;
+
+    const rows = [
+        { label: "User ID", valueHtml: userId },
+        { label: "Email", valueHtml: safeEmail },
+        { label: "Mobile", valueHtml: safeMobile },
+        { label: "Status", valueHtml: escapeHtml("Inactive — pending your approval") },
+    ];
+
+    const footerHtml = `This is an automated message from SvayamExpense. Please do not reply to this email.`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml,
+    });
+
+    const text = [
+        "New user registration on SvayamExpense",
+        "",
+        `Name: ${detail.name || "—"}`,
+        `Email: ${detail.email || "—"}`,
+        `Mobile: ${detail.mobile || "—"}`,
+        `User ID: ${detail.userId ?? "—"}`,
+        "",
+        "The account is inactive until an admin activates it in the dashboard.",
+        "",
+        "— SvayamExpense",
+    ].join("\n");
+
+    const to = list[0];
+    const bcc = list.length > 1 ? list.slice(1) : undefined;
+    return sendMail({ to, bcc, subject, html, text, attachments });
+};
+
+/**
+ * When admin activates a user account (new registration or admin approval).
+ */
+export const sendUserAccountActivatedEmail = async (to, detail) => {
+    const email = String(to || "").trim();
+    if (!email) return false;
+
+    const safeName = String(detail.name || "there").trim() || "there";
+    const note = detail.adminNote ? String(detail.adminNote).trim() : "";
+
+    const subject = "Your SvayamExpense account is active — you can add expenses";
+
+    const headline = "Account activated";
+    const sublineHtml = `Hi <strong style="color:#334155;">${escapeHtml(safeName)}</strong>, your <strong>SvayamExpense</strong> account has been <strong style="color:#334155;">activated</strong>. You can sign in and start adding expenses.`;
+
+    const cardTitle = "You are all set";
+    const cardSubtitle = "Account status";
+    const cardIntroHtml = note
+        ? `Administrator note: <strong style="color:#334155;">${escapeHtml(note)}</strong><br/><br/>Sign in with your email and password to use the app.`
+        : `Sign in with your email and password to log expenses, attach receipts, and track your monthly budget.`;
+
+    const rows = [
+        { label: "Status", valueHtml: escapeHtml("Active") },
+        { label: "Expenses", valueHtml: escapeHtml("You can add expenses now") },
+    ];
+
+    const footerHtml = `This is an automated message from SvayamExpense. Please do not reply to this email.`;
+
+    const { html, attachments } = layoutSvayamExpenseEmail({
+        headline,
+        sublineHtml,
+        cardTitle,
+        cardSubtitle,
+        cardIntroHtml,
+        rows,
+        footerHtml,
+    });
+
+    const text = [
+        `Hi ${safeName},`,
+        "",
+        "Your SvayamExpense account has been activated.",
+        "You can sign in and add expenses.",
+        note ? `Note from admin: ${note}` : "",
+        "",
+        "— SvayamExpense",
+    ]
+        .filter(Boolean)
+        .join("\n");
+
+    return sendMail({ to: email, subject, html, text, attachments });
+};

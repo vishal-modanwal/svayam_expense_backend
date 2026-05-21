@@ -1,7 +1,12 @@
 import bcrypt from 'bcryptjs';
 import { pool } from '../db/index.js';
+import { selectRowArray } from '../utils/mariaRows.js';
 import { sendEmailOTP } from '../utils/emailService.js';
 import { otp  , getOTPExpiry} from '../utils/otp.js';
+import {
+    ACTIVATION_STATUS,
+    isMissingActivationTableError,
+} from '../utils/activationRequest.js';
 
 /**
  * Logged-in user's account activity (enabled / disabled by admin).
@@ -20,13 +25,53 @@ export const getMyActivityStatus = async (req, res) => {
         const uid = typeof row.id === "bigint" ? Number(row.id) : Number(row.id);
         const active = Number(row.is_active) === 1;
 
+        let activation_request = null;
+        if (!active) {
+            const reqRows = selectRowArray(
+                await pool.query(
+                    `SELECT id, status, message, admin_note, created_at, reviewed_at
+                     FROM user_activation_requests
+                     WHERE user_id = ?
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 1`,
+                    [uid]
+                )
+            );
+            if (reqRows.length) {
+                const r = reqRows[0];
+                activation_request = {
+                    id: typeof r.id === "bigint" ? Number(r.id) : r.id,
+                    status: r.status,
+                    message: r.message ?? null,
+                    admin_note: r.admin_note ?? null,
+                    created_at: r.created_at,
+                    reviewed_at: r.reviewed_at ?? null,
+                    can_submit_new: r.status !== ACTIVATION_STATUS.PENDING,
+                };
+            } else {
+                activation_request = { can_submit_new: true };
+            }
+        }
+
         res.json({
             status: "success",
             user_id: uid,
             is_active: active,
-            activity_status: active ? "active" : "inactive"
+            activity_status: active ? "active" : "inactive",
+            activation_request,
         });
     } catch (error) {
+        if (isMissingActivationTableError(error)) {
+            const uid = typeof req.user.id === "bigint" ? Number(req.user.id) : req.user.id;
+            const active = Number(req.user?.is_active) === 1;
+            return res.json({
+                status: "success",
+                user_id: uid,
+                is_active: active,
+                activity_status: active ? "active" : "inactive",
+                activation_request: null,
+            });
+        }
         res.status(500).json({ error: error.message });
     }
 };
@@ -45,7 +90,16 @@ export const getMe = async (req, res) => {
 
         if (rows.length === 0) return res.status(404).json({ message: "User not found" });
 
-        res.json({ user: rows[0] });
+        const user = rows[0];
+        const active = Number(req.user?.is_active) === 1;
+        res.json({
+            user: {
+                ...user,
+                id: typeof user.id === "bigint" ? Number(user.id) : user.id,
+                is_active: active,
+                activity_status: active ? "active" : "inactive",
+            },
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

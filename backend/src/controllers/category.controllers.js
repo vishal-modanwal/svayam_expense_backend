@@ -1,7 +1,11 @@
 import { pool } from "../db/index.js";
 import { selectRowArray, isMissingArchivedColumnError } from "../utils/mariaRows.js";
 import { ARCHIVED_NO, ARCHIVED_YES, activeCategoryWhere, archivedCategoryWhere } from "../utils/categoryArchive.js";
-import { archiveCategoryCascade, isArchivedYes } from "../utils/archiveCategory.js";
+import {
+    archiveCategoryCascade,
+    hardDeleteCategoryCascade,
+    isArchivedYes,
+} from "../utils/archiveCategory.js";
 
 const num = (v) => (typeof v === "bigint" ? Number(v) : Number(v || 0));
 
@@ -146,33 +150,57 @@ export const updateCategory = async (req, res) => {
     }
 };
 
+const isPermanentDeleteQuery = (req) =>
+    req.query.permanent === "true" ||
+    req.query.permanent === "1" ||
+    req.query.hard === "true" ||
+    req.query.hard === "1";
+
 /**
- * ARCHIVE CATEGORY — sets archived=yes on category, budgets, and expenses (name unchanged).
+ * DELETE /api/category/:id — soft archive (default).
+ * DELETE /api/category/:id?permanent=true — admin hard delete (irreversible).
  */
 export const deleteCategory = async (req, res) => {
-    const { id } = req.params;
+    const categoryId = parseInt(req.params.id, 10);
+    if (!Number.isFinite(categoryId)) {
+        return res.status(400).json({ message: "Invalid category id." });
+    }
+
+    if (isPermanentDeleteQuery(req)) {
+        return hardDeleteCategory(req, res, categoryId);
+    }
 
     let connection;
     try {
         const existing = selectRowArray(
-            await pool.query("SELECT id, archived FROM categories WHERE id = ?", [id])
+            await pool.query("SELECT id, archived FROM categories WHERE id = ?", [
+                categoryId,
+            ])
         );
         if (existing.length === 0) {
             return res.status(404).json({ message: "Category not found" });
         }
         if (isArchivedYes(existing[0].archived)) {
-            return res.status(400).json({ message: "Category is already archived." });
+            return res.status(400).json({
+                message: "Category is already archived.",
+                hint: "Use DELETE with ?permanent=true to remove permanently.",
+            });
         }
 
         connection = await pool.getConnection();
         await connection.beginTransaction();
         const actorId = num(req.user?.id);
-        await archiveCategoryCascade(connection, id, Number.isFinite(actorId) ? actorId : null);
+        await archiveCategoryCascade(
+            connection,
+            categoryId,
+            Number.isFinite(actorId) ? actorId : null
+        );
         await connection.commit();
 
         res.json({
             message: "Category archived successfully.",
             archived: true,
+            permanent: false,
             policy: {
                 expenses_and_budgets: "marked_archived_for_history",
                 new_expenses_and_budget_assignments: "use_active_categories_only",
@@ -192,3 +220,53 @@ export const deleteCategory = async (req, res) => {
         if (connection) connection.release();
     }
 };
+
+async function hardDeleteCategory(req, res, categoryId) {
+    let connection;
+    try {
+        const existing = selectRowArray(
+            await pool.query(
+                "SELECT id, name, archived FROM categories WHERE id = ?",
+                [categoryId]
+            )
+        );
+        if (existing.length === 0) {
+            return res.status(404).json({ message: "Category not found" });
+        }
+
+        const row = existing[0];
+        connection = await pool.getConnection();
+        await connection.beginTransaction();
+        const { expenses_deleted, budgets_deleted } =
+            await hardDeleteCategoryCascade(connection, categoryId);
+        await connection.commit();
+
+        res.json({
+            message: "Category permanently deleted.",
+            permanent: true,
+            category_id: categoryId,
+            category_name: row.name,
+            was_archived: isArchivedYes(row.archived),
+            deleted: {
+                expenses: expenses_deleted,
+                monthly_budgets: budgets_deleted,
+                category: 1,
+            },
+        });
+    } catch (error) {
+        if (connection) await connection.rollback();
+        if (error?.statusCode === 404) {
+            return res.status(404).json({ message: "Category not found" });
+        }
+        if (error?.errno === 1451 || error?.code === "ER_ROW_IS_REFERENCED_2") {
+            return res.status(409).json({
+                message:
+                    "Cannot permanently delete category: linked records still reference it.",
+                code: "CATEGORY_DELETE_REFERENCED",
+            });
+        }
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (connection) connection.release();
+    }
+}

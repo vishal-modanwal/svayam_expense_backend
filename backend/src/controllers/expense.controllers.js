@@ -20,6 +20,7 @@ import {
     fireUserBudgetSync,
     monthYearFromExpenseDate,
 } from '../utils/userMonthlyBudget.js';
+import { resolvePeriodFromQuery } from '../utils/periodQuery.js';
 
 /** MariaDB driver often returns insertId / INT columns as BigInt; JSON.stringify cannot serialize BigInt */
 const jsonNumber = (v) => (typeof v === 'bigint' ? Number(v) : v);
@@ -276,10 +277,11 @@ export const addExpense = async (req, res) => {
 };
 /**
  * Shared list query for expenses.
- * @param {{ mode?: 'my' }} [options] — `mode: 'my'` enables my-expenses rules: default limit 15, search title/vendor, sort whitelist, order asc|desc only.
+ * @param {{ mode?: 'my', period?: { month: number, year: number } }} [options]
  */
 const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) => {
     const isMy = options.mode === "my";
+    const period = options.period;
     const page = Math.max(parseInt(reqQuery.page, 10) || 1, 1);
     const orderRaw = String(reqQuery.order ?? "desc").toLowerCase();
     const orderDir = orderRaw === "asc" ? "ASC" : "DESC";
@@ -290,6 +292,11 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
 
     const clauses = [...whereClauses];
     const params = [...queryParams];
+
+    if (period) {
+        clauses.push("MONTH(e.expense_date) = ?", "YEAR(e.expense_date) = ?");
+        params.push(period.month, period.year);
+    }
 
     if (isMy) {
         limit = Math.min(Math.max(parseInt(reqQuery.limit, 10) || 15, 1), 100);
@@ -390,6 +397,7 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
 
     const result = {
         scope: "active",
+        ...(period ? { period: { month: period.month, year: period.year } } : {}),
         data: rows.map((row) => {
             const r = mapExpenseRowWithCategoryMeta(row);
             r.category_status = "active";
@@ -415,6 +423,11 @@ const fetchExpenses = async (whereClauses, queryParams, reqQuery, options = {}) 
  */
 export const getAllExpenses = async (req, res) => {
     try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+
         const { category_id } = req.query;
         let whereClauses = [];
         let queryParams = [];
@@ -424,7 +437,9 @@ export const getAllExpenses = async (req, res) => {
             queryParams.push(category_id);
         }
 
-        const result = await fetchExpenses(whereClauses, queryParams, req.query);
+        const result = await fetchExpenses(whereClauses, queryParams, req.query, {
+            period,
+        });
         res.json({ status: "success", ...result });
     } catch (error) {
         const status = error.status || 500;
@@ -444,6 +459,11 @@ export const getAllExpenses = async (req, res) => {
  */
 export const getUserExpenses = async (req, res) => {
     try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+
         const { category_id } = req.query;
         const uid = jsonNumber(req.user.id);
         if (!Number.isFinite(uid)) {
@@ -457,7 +477,10 @@ export const getUserExpenses = async (req, res) => {
             queryParams.push(category_id);
         }
 
-        const result = await fetchExpenses(whereClauses, queryParams, req.query, { mode: "my" });
+        const result = await fetchExpenses(whereClauses, queryParams, req.query, {
+            mode: "my",
+            period,
+        });
         res.json({ status: "success", ...result });
     } catch (error) {
         const status = error.status || 500;
@@ -473,13 +496,20 @@ export const getUserExpenses = async (req, res) => {
  */
 export const  searchExpensesByUserName = async (req, res) => {
     try {
+        const period = resolvePeriodFromQuery(req.query);
+        if (period.error) {
+            return res.status(400).json({ message: period.error });
+        }
+
         const { search = '' } = req.query;
         if (!search) return res.status(400).json({ message: "Search query is required" });
 
         let whereClauses = ["u.name LIKE ?"];
         let queryParams = [`%${search}%`];
 
-        const result = await fetchExpenses(whereClauses, queryParams, req.query);
+        const result = await fetchExpenses(whereClauses, queryParams, req.query, {
+            period,
+        });
         res.json({ status: "success", ...result });
     } catch (error) {
         const status = error.status || 500;

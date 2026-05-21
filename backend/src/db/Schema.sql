@@ -27,6 +27,18 @@ CREATE TABLE users (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
+-- 1b. REGISTRATION PENDING (OTP only — full user row created on POST /api/auth/register)
+CREATE TABLE registration_pending (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(150) NOT NULL,
+    otp_code VARCHAR(6) NULL DEFAULT NULL,
+    otp_expiry DATETIME NULL DEFAULT NULL,
+    email_verified_at DATETIME NULL DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_registration_pending_email (email)
+);
+
 -- 2. CATEGORIES MASTER
 -- archived: 'no' = live; 'yes' = history only (name unchanged)
 CREATE TABLE categories (
@@ -53,6 +65,24 @@ CREATE TABLE monthly_budgets (
     FOREIGN KEY (created_by) REFERENCES users(id),
     UNIQUE KEY unique_budget_period (category_id, month, year),
     INDEX idx_monthly_budgets_archived (archived)
+);
+
+-- 3a. USER ACTIVATION REQUESTS (inactive user → admin approve/reject)
+CREATE TABLE user_activation_requests (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    status ENUM('pending', 'approved', 'rejected', 'cancelled') NOT NULL DEFAULT 'pending',
+    message TEXT NULL,
+    admin_note TEXT NULL,
+    reviewed_by INT NULL,
+    reviewed_at DATETIME NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_activation_requests_user (user_id),
+    INDEX idx_activation_requests_status (status),
+    INDEX idx_activation_requests_created (created_at)
 );
 
 -- 3b. USER MONTHLY BUDGETS (optional per user; no row = category budget only)
@@ -224,3 +254,34 @@ CREATE TABLE IF NOT EXISTS user_monthly_budgets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_expenses_user_budget_spent ON expenses (user_id, expense_type, archived, expense_date);
+
+-- =========================================================
+-- IDEMPOTENT UPGRADE: user activation requests (inactive → admin review)
+-- =========================================================
+CREATE TABLE IF NOT EXISTS registration_pending (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(150) NOT NULL,
+    otp_code VARCHAR(6) NULL DEFAULT NULL,
+    otp_expiry DATETIME NULL DEFAULT NULL,
+    email_verified_at DATETIME NULL DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_registration_pending_email (email)
+);
+
+CREATE TABLE IF NOT EXISTS user_activation_requests (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    status ENUM('pending', 'approved', 'rejected', 'cancelled') NOT NULL DEFAULT 'pending',
+    message TEXT NULL,
+    admin_note TEXT NULL,
+    reviewed_by INT NULL,
+    reviewed_at DATETIME NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL,
+    INDEX idx_activation_requests_user (user_id),
+    INDEX idx_activation_requests_status (status),
+    INDEX idx_activation_requests_created (created_at)
+);
