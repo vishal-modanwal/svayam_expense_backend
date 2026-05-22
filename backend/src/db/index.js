@@ -8,6 +8,7 @@ export const pool = mariadb.createPool({
     user: process.env.DB_USER, 
     password: process.env.DB_PASSWORD,
     database: 'Svayam_Expense_Tracker',
+    charset: 'utf8mb4',
     connectionLimit: 10
 });
 

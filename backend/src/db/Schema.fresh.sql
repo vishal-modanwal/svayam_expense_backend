@@ -2,16 +2,22 @@
 -- Svayam Expense Tracker — FRESH INSTALL (final schema only)
 -- Database: Svayam_Expense_Tracker
 --
--- Use on a new server / empty database:
+-- Use on a new server or after DROP (full reset):
+--   DROP DATABASE IF EXISTS Svayam_Expense_Tracker;
 --   mysql -u root -p < Schema.fresh.sql
 --
--- No ALTER / migration blocks. Equivalent to Schema.sql final state.
--- APIs: auth, category, budget, expense, notifications, cron, archives.
+-- No ALTER blocks. All tables utf8mb4 (₹, Hindi, emoji safe).
+-- Equivalent to Schema.sql final state for backend APIs.
 -- After install: cron handles future months (4 defaults: copy prev else 5000).
 -- =========================================================
 
-CREATE DATABASE IF NOT EXISTS Svayam_Expense_Tracker;
+CREATE DATABASE IF NOT EXISTS Svayam_Expense_Tracker
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
 USE Svayam_Expense_Tracker;
+
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 1. USERS
@@ -30,7 +36,7 @@ CREATE TABLE users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_users_role_active (role, is_active)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 1b. REGISTRATION PENDING (OTP before full register)
@@ -44,7 +50,7 @@ CREATE TABLE registration_pending (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY unique_registration_pending_email (email)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 2. CATEGORIES
@@ -58,7 +64,7 @@ CREATE TABLE categories (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_categories_archived (archived),
     INDEX idx_categories_name_active (name, archived)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 3. MONTHLY BUDGETS (per category, per month/year)
@@ -77,7 +83,7 @@ CREATE TABLE monthly_budgets (
     UNIQUE KEY unique_budget_period (category_id, month, year),
     INDEX idx_monthly_budgets_archived (archived),
     INDEX idx_monthly_budgets_period (year, month)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 3a. USER ACTIVATION REQUESTS
@@ -97,7 +103,7 @@ CREATE TABLE user_activation_requests (
     INDEX idx_activation_requests_user (user_id),
     INDEX idx_activation_requests_status (status),
     INDEX idx_activation_requests_created (created_at)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 3b. USER MONTHLY BUDGETS (optional per-user cap)
@@ -119,7 +125,7 @@ CREATE TABLE user_monthly_budgets (
     UNIQUE KEY unique_user_budget_period (user_id, month, year),
     INDEX idx_user_monthly_budgets_period (year, month),
     INDEX idx_user_monthly_budgets_user (user_id)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 4. EXPENSES
@@ -151,7 +157,7 @@ CREATE TABLE expenses (
     INDEX idx_expenses_user_exp_date (user_id, expense_date),
     INDEX idx_expenses_category_type_exp_date (category_id, expense_type, expense_date),
     INDEX idx_expenses_user_budget_spent (user_id, expense_type, archived, expense_date)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- 5. NOTIFICATIONS
@@ -168,7 +174,7 @@ CREATE TABLE notifications (
     FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE SET NULL,
     INDEX idx_notifications_user (user_id),
     INDEX idx_notifications_read (user_id, is_read)
-);
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------
 -- ANALYTICS VIEW (live rows only)
